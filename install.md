@@ -26,13 +26,21 @@ Everything here runs locally. No API keys needed beyond your existing Claude Cod
 
 ### Linux
 
-1. Copy the script:
+1. Create a dedicated `claude` user (if you don't already have one):
+   ```bash
+   sudo useradd -m -s /bin/bash claude
+   ```
+   Claude Code cannot run as root with `--dangerously-skip-permissions`. The script auto-detects if you're root and re-execs as the `claude` user via `sudo -u claude`. If you always run as a non-root user, you can skip this step and the re-exec will never trigger.
+
+2. Copy the script:
    ```bash
    sudo cp claudedsp-linux.sh /usr/local/bin/claudedsp
    sudo chmod +x /usr/local/bin/claudedsp
    ```
 
-2. Type `claudedsp` to launch Claude Code with session management.
+3. If using the `claude` user, make sure Claude Code is installed for that user and the `claude` user has access to your project directories.
+
+4. Type `claudedsp` to launch Claude Code with session management.
 
 ## Step 2: Context-Manager (Layer 1, Compaction Insurance)
 
