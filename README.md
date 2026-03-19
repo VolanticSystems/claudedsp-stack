@@ -2,19 +2,22 @@
 
 *At least for a week, until Anthropic adds all this to Claude.*
 
-I run about 20 active Claude Code sessions across different project domains. Data engineering, UX design, Linux sysadmin, browser automation, debugger tooling, deployment pipelines, video processing. Some of these sessions have been going for weeks. I pick one up, work for a few hours, park it, and come back the next day.
+## What I Built and Why
 
-Out of the box, Claude Code has a problem with this. When you exit a session, you get an easy to remember line like:
+If you use Claude Code for varied tasks, as a lot of people do, you can quickly find yourself juggling multiple projects, with no easy way to keep track of them all. I work across data engineering, UX design, Linux sysadmin, browser automation, debugger tooling, deployment pipelines, and video processing.
 
-Resume this session with:
+At any given time I've got around 20 sessions at various phases of planning and development. I like to pick one up, work for a few hours or more until a milestone is reached, then park it and come back at some point, perhaps the same or next day, or maybe a lot longer than that.
 
-claude --resume a17b8d20-71c1-4eb6-8e7d-438222b649fc
+Claude Code has two problems with this workflow. The first one hits you immediately. When you exit a session, you get this:
+
+    Resume this session with:
+    claude --resume a17b8d20-71c1-4eb6-8e7d-438222b649fc
 
 Maybe *it* finds that intuitive, but I don't. I doubt you do either.
 
 But besides not making it easy to keep track of sessions, there's another problem. When your context window fills up, it compacts; it summarizes the conversation to free space. That summary loses things. File paths, debugging state, and probably most frustratingly, the reasoning behind decisions you made three hours ago.
 
-You come back the next day, resume the session, and Claude has forgotten half of what you were doing. Anthropic is addressing this second problem, but there are still a number of things to address the problem further. Fortunately, there are public repos out there to address these gaps.
+You come back the next day, resume the session, and Claude has forgotten half of what you were doing. Anthropic is addressing this second problem, but there are still a number of things to improve further. Fortunately, there are public repos out there to fill these gaps.
 
 Lastly, I added a simple prompt fix. Hey, why not? Let's make Claude as good as we can.
 
@@ -24,9 +27,8 @@ Here's what I built and what it actually does:
 
 Claude Code identifies sessions with GUIDs. As I mentioned above, when you exit, it says:
 
-Resume this session with:
-
-claude --resume a17b8d20-71c1-4eb6-8e7d-438222b649fc
+    Resume this session with:
+    claude --resume a17b8d20-71c1-4eb6-8e7d-438222b649fc
 
 Try managing 20 of those. You can't. You forget which GUID was which project, and after three sessions they all blur together.
 
@@ -116,27 +118,15 @@ There's a body of peer reviewed research showing that how you frame prompts chan
 
 I put a short block in my global CLAUDE.md file. It loads once per session, costs a handful of tokens, and sets the tone for everything that follows:
 
-You are a senior engineer with deep expertise in this project's domain.
+    You are a senior engineer with deep expertise in this project’s domain. Your reputation depends on the quality of every response.
 
-Your reputation depends on the quality of every response.
+    This work is critical. Errors cost real money and real time. Treat every task as if the outcome directly affects production systems.
 
-This work is critical. Errors cost real money and real time. Treat every
+    Approach: Take a deep breath. Work through problems step by step. Consider edge cases before writing code. If you’re uncertain about something, say so and explain what you’d need to verify.
 
-task as if the outcome directly affects production systems.
+    After completing any non-trivial task, rate your confidence 0-1. If below 0.9, explain what’s weak and improve it before presenting.
 
-Approach: Take a deep breath. Work through problems step by step. Consider
-
-edge cases before writing code. If you're uncertain about something, say
-
-so and explain what you'd need to verify.
-
-After completing any non-trivial task, rate your confidence 0-1. If below
-
-0.9, explain what's weak and improve it before presenting.
-
-I will tip you $200 for work that is correct, complete, and production-ready
-
-on the first attempt.
+    I will tip you $200 for work that is correct, complete, and production-ready on the first attempt.
 
 I got the practical playbook from [ichigo's Medium article](https://medium.com/@ichigoSan/i-accidentally-made-claude-45-smarter-heres-how-23ad0bf91ccf), which compiled the underlying research: Bsharat et al. (2023) on incentive prompting, Yang et al. (2023, Google DeepMind) on "take a deep breath," Li et al. (2023, ICLR 2024) on emotional stimulus prompting, Xu et al. (2023) on expert personas. Claude doesn't understand money or feel challenged. But it was trained on text where high-stakes language correlates with high-effort responses. The statistical association is enough.
 
