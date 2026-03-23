@@ -5,6 +5,18 @@ function claudedsp {
     $sessionsFile = "$dspDir\sessions.txt"
     $notesDir = "$dspDir\notes"
     $claudeExe = "$env:USERPROFILE\.local\bin\claude.exe"
+    $cmvExe = "$env:APPDATA\npm\cmv.cmd"
+
+    $defaultRefreshPrompt = @'
+Read your memories. This is a fresh session replacing a long previous conversation on this project. Everything you need to know is in:
+
+1. Your memory files (MEMORY.md and all linked files)
+2. Any documentation in the project directory (markdown files, QA reviews, specs)
+3. The codebase itself (git log for history)
+4. project_current_state.md in your memory if it exists
+
+Read all of these before responding. Then tell me what you understand about: the current state of the project, what works, what is pending, and what your behavioral rules are. Do not start any development until I tell you to.
+'@
 
     if (-not (Test-Path $dspDir)) { New-Item -ItemType Directory -Path $dspDir | Out-Null }
     if (-not (Test-Path $notesDir)) { New-Item -ItemType Directory -Path $notesDir | Out-Null }
@@ -175,6 +187,115 @@ function claudedsp {
             if (-not (Test-Path $notePath)) { New-Item -ItemType File -Path $notePath -Force | Out-Null }
             notepad $notePath
         }
+
+        # Anti-bloat: trim
+        Write-Host ""
+        $doTrim = Read-Host "  Trim this session? [y/N]"
+        if ($doTrim -eq 'y') {
+            if (Test-Path $cmvExe) {
+                Write-Host "  Trimming session..."
+                $trimOutput = & $cmvExe trim --latest --skip-launch 2>&1 | Out-String
+                $newGuidMatch = [regex]::Match($trimOutput, 'Session ID:\s*([0-9a-f-]+)')
+                if ($newGuidMatch.Success) {
+                    $newGuid = $newGuidMatch.Groups[1].Value
+                    # Update GUID in sessions.txt
+                    $sessions = Get-Sessions
+                    foreach ($s in $sessions) {
+                        if ($s.Guid -eq $guid) { $s.Guid = $newGuid }
+                    }
+                    Save-Sessions $sessions
+                    # Rename notes file if it exists
+                    $oldNotePath = "$notesDir\$guid.txt"
+                    if (Test-Path $oldNotePath) {
+                        Move-Item $oldNotePath "$notesDir\$newGuid.txt"
+                    }
+                    $guid = $newGuid
+                    $trimOutput -split "`n" | Where-Object { $_ -notmatch 'Session ID:' -and $_.Trim() } | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" }
+                    Write-Host ""
+                    Write-Host "  Session trimmed. New ID: $newGuid"
+                } else {
+                    Write-Host "  Trim failed or no new session ID found."
+                    $trimOutput | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+                }
+            } else {
+                Write-Host "  cmv not found. Skipping trim."
+            }
+        }
+
+        # Anti-bloat: refresh (deeper clean)
+        Write-Host ""
+        $doRefresh = Read-Host "  Replace current session with a fresh one? (deeper clean) [y/N]"
+        if ($doRefresh -eq 'y') {
+            $sessions = Get-Sessions
+            $curSession = $sessions | Where-Object { $_.Guid -eq $guid } | Select-Object -First 1
+            $curDesc = if ($curSession) { $curSession.Desc } else { "Unnamed" }
+            $curDir = if ($curSession) { $curSession.Dir } else { (Get-Location).Path }
+
+            Write-Host ""
+            $newName = Read-Host "  Name for new session (Enter for '$curDesc')"
+            if (-not $newName) { $newName = $curDesc }
+
+            # Offer to edit the refresh prompt
+            $promptFile = "$dspDir\refresh-prompt.tmp"
+            $defaultRefreshPrompt | Set-Content $promptFile
+            $editPrompt = Read-Host "  Edit the refresh prompt? (Ctrl-S, close when done) [y/N]"
+            if ($editPrompt -eq 'y') {
+                Start-Process notepad $promptFile -Wait
+            }
+            $promptText = Get-Content $promptFile -Raw
+            Remove-Item $promptFile -ErrorAction SilentlyContinue
+
+            # Run Claude headless from the session's directory
+            $refreshOrigDir = Get-Location
+            Set-Location $curDir
+            Write-Host ""
+            # Spinner while Claude creates the session
+            $job = Start-Job -ScriptBlock {
+                param($exe, $prompt)
+                & $exe --dangerously-skip-permissions -p $prompt 2>&1 | Out-Null
+            } -ArgumentList $claudeExe, $promptText
+            $spin = [char[]]@('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
+            $i = 0
+            while ($job.State -eq 'Running') {
+                Write-Host "`r  $($spin[$i % $spin.Length]) Please wait while the new session is created..." -NoNewline
+                Start-Sleep -Milliseconds 100
+                $i++
+            }
+            Receive-Job $job | Out-Null
+            Remove-Job $job
+            Write-Host "`r  ✓ Done.                                              "
+            Set-Location $refreshOrigDir
+
+            # Capture new session GUID
+            $projKey = $curDir -replace ':', '-' -replace '\\', '-'
+            $projDirClaude = "$env:USERPROFILE\.claude\projects\$projKey"
+            $newest = Get-ChildItem "$projDirClaude\*.jsonl" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($newest) {
+                $freshGuid = $newest.BaseName
+                # Rewrite sessions: new at top, old "(old)" at bottom
+                $sessions = Get-Sessions
+                $oldEntry = $null
+                $others = @()
+                foreach ($s in $sessions) {
+                    if ($s.Guid -eq $guid) {
+                        $oldDesc = if ($s.Desc -match '\(old\)') { $s.Desc } else { "$($s.Desc) (old)" }
+                        $oldEntry = [PSCustomObject]@{ Guid=$s.Guid; Dir=$s.Dir; Desc=$oldDesc }
+                    } else {
+                        $others += $s
+                    }
+                }
+                $freshEntry = [PSCustomObject]@{ Guid=$freshGuid; Dir=$curDir; Desc=$newName }
+                $newSessions = @($freshEntry) + @($others)
+                if ($oldEntry) { $newSessions += $oldEntry }
+                Save-Sessions $newSessions
+                Write-Host ""
+                Write-Host "  Fresh session created: $newName"
+                Write-Host "  Old session moved to bottom of list."
+            } else {
+                Write-Host "  Warning: Could not find new session GUID."
+            }
+        }
     }
 
     function Do-Resume($pick, $sessions) {
@@ -208,7 +329,18 @@ function claudedsp {
         $origDir = Get-Location
         Set-Location $sel.Dir
         & $claudeExe --dangerously-skip-permissions --resume $sel.Guid
-        Do-PostExit $sel.Guid
+        if ($LASTEXITCODE -eq 0) {
+            Do-PostExit $sel.Guid
+        } else {
+            Write-Host ""
+            $delEntry = Read-Host "  Session not found. Delete this entry? [Y/n]"
+            if ($delEntry -ne 'n') {
+                $sessions = Get-Sessions
+                $sessions = @($sessions | Where-Object { $_.Guid -ne $sel.Guid })
+                Save-Sessions $sessions
+                Write-Host "  Entry removed."
+            }
+        }
         Set-Location $origDir
     }
 
@@ -321,7 +453,17 @@ function claudedsp {
             $useExisting = Read-Host "  Resume this session? [Y/n]"
             if ($useExisting -ne 'n') {
                 & $claudeExe --dangerously-skip-permissions --resume $match.Guid
-                Do-PostExit $match.Guid
+                if ($LASTEXITCODE -eq 0) {
+                    Do-PostExit $match.Guid
+                } else {
+                    Write-Host ""
+                    $delEntry = Read-Host "  Session not found. Delete this entry? [Y/n]"
+                    if ($delEntry -ne 'n') {
+                        $sessions = @($sessions | Where-Object { $_.Guid -ne $match.Guid })
+                        Save-Sessions $sessions
+                        Write-Host "  Entry removed."
+                    }
+                }
                 if ($projDir) { Set-Location $origDir }
                 return
             }
@@ -336,6 +478,11 @@ function claudedsp {
         & $claudeExe --dangerously-skip-permissions @passArgs
     } else {
         & $claudeExe --dangerously-skip-permissions
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        if ($projDir) { Set-Location $origDir }
+        return
     }
 
     if ($preNamed) {

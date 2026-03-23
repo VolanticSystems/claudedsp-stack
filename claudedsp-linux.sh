@@ -20,7 +20,17 @@ DSP_DIR="$HOME/.claudedsp"
 SESSIONS_FILE="$DSP_DIR/sessions.txt"
 NOTES_DIR="$DSP_DIR/notes"
 CLAUDE_EXE=$(command -v claude || echo "$HOME/.local/bin/claude")
+CMV_EXE=$(command -v cmv 2>/dev/null || echo "$HOME/.npm-global/bin/cmv")
 EDITOR="${EDITOR:-nano}"
+
+DEFAULT_REFRESH_PROMPT='Read your memories. This is a fresh session replacing a long previous conversation on this project. Everything you need to know is in:
+
+1. Your memory files (MEMORY.md and all linked files)
+2. Any documentation in the project directory (markdown files, QA reviews, specs)
+3. The codebase itself (git log for history)
+4. project_current_state.md in your memory if it exists
+
+Read all of these before responding. Then tell me what you understand about: the current state of the project, what works, what is pending, and what your behavioral rules are. Do not start any development until I tell you to.'
 
 mkdir -p "$DSP_DIR" "$NOTES_DIR"
 touch "$SESSIONS_FILE"
@@ -103,6 +113,148 @@ update_desc() {
     mv "$tmp" "$SESSIONS_FILE"
 }
 
+do_trim() {
+    # Trim the current session via CMV. Returns new GUID in TRIM_NEW_GUID.
+    TRIM_NEW_GUID=""
+    if ! command -v "$CMV_EXE" &>/dev/null; then
+        echo "  cmv not found. Skipping trim."
+        return 1
+    fi
+    echo "  Trimming session..."
+    local trim_output
+    trim_output=$("$CMV_EXE" trim --latest --skip-launch 2>&1)
+    local new_guid
+    new_guid=$(echo "$trim_output" | grep -oP 'Session ID:\s*\K[0-9a-f-]+')
+    if [[ -z "$new_guid" ]]; then
+        echo "  Trim failed or no new session ID found."
+        echo "$trim_output" | head -5
+        return 1
+    fi
+    # Update GUID in sessions.txt
+    local tmp="$SESSIONS_FILE.tmp"
+    while IFS='|' read -r guid dir desc; do
+        if [[ "$guid" == "$SESSION_GUID" ]]; then
+            echo "$new_guid|$dir|$desc"
+        else
+            echo "$guid|$dir|$desc"
+        fi
+    done < "$SESSIONS_FILE" > "$tmp"
+    mv "$tmp" "$SESSIONS_FILE"
+    # Rename notes file if it exists
+    if [[ -f "$NOTES_DIR/$SESSION_GUID.txt" ]]; then
+        mv "$NOTES_DIR/$SESSION_GUID.txt" "$NOTES_DIR/$new_guid.txt"
+    fi
+    # Ensure trimmed JSONL is accessible from the session's project dir
+    local session_dir=""
+    while IFS='|' read -r g d desc_; do
+        [[ "$g" == "$new_guid" ]] && session_dir="$d" && break
+    done < "$SESSIONS_FILE"
+    if [[ -n "$session_dir" ]]; then
+        local expected_key expected_dir expected_file
+        expected_key=$(echo "$session_dir" | sed 's|/|-|g')
+        expected_dir="$HOME/.claude/projects/$expected_key"
+        expected_file="$expected_dir/$new_guid.jsonl"
+        if [[ ! -f "$expected_file" ]]; then
+            # Find where CMV actually put it
+            local actual
+            actual=$(find "$HOME/.claude/projects" -name "$new_guid.jsonl" 2>/dev/null | head -1)
+            if [[ -n "$actual" ]]; then
+                mkdir -p "$expected_dir"
+                ln -s "$actual" "$expected_file"
+            fi
+        fi
+    fi
+    SESSION_GUID="$new_guid"
+    TRIM_NEW_GUID="$new_guid"
+    # Show trim stats (skip the Session ID line we already parsed)
+    echo "$trim_output" | grep -v "Session ID:" | grep -v "^$" | head -10
+    echo ""
+    echo "  Session trimmed. New ID: $new_guid"
+}
+
+do_refresh() {
+    # Replace current session with a fresh one.
+    # Old session gets "(old)" appended and moved to bottom.
+
+    # Get current session's description and directory from sessions.txt
+    local cur_desc="" cur_dir=""
+    while IFS='|' read -r guid dir desc; do
+        if [[ "$guid" == "$SESSION_GUID" ]]; then
+            cur_desc="$desc"
+            cur_dir="$dir"
+            break
+        fi
+    done < "$SESSIONS_FILE"
+    [[ -z "$cur_dir" ]] && cur_dir=$(pwd)
+
+    # Ask for new session name (default: same as current)
+    echo ""
+    read -rp "  Name for new session (Enter for '$cur_desc'): " new_name
+    [[ -z "$new_name" ]] && new_name="$cur_desc"
+
+    # Offer to edit the refresh prompt
+    local prompt_file="$DSP_DIR/refresh-prompt.tmp"
+    echo "$DEFAULT_REFRESH_PROMPT" > "$prompt_file"
+    read -rp "  Edit the refresh prompt? (Ctrl-X when done) [y/N]: " edit_prompt
+    if [[ "${edit_prompt,,}" == "y" ]]; then
+        $EDITOR "$prompt_file"
+    fi
+    local prompt_text
+    prompt_text=$(cat "$prompt_file")
+    rm -f "$prompt_file"
+
+    # Run Claude headless with the prompt, from the session's directory
+    local orig_dir
+    orig_dir=$(pwd)
+    cd "$cur_dir" || { echo "  Error: Can't cd to $cur_dir"; return 1; }
+    echo ""
+    "$CLAUDE_EXE" --dangerously-skip-permissions -p "$prompt_text" > /dev/null 2>&1 &
+    local pid=$!
+    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  %s Please wait while the new session is created..." "${spin:i++%${#spin}:1}"
+        sleep 0.1
+    done
+    printf "\r  ✓ Done.                                              \n"
+    wait "$pid"
+
+    # Capture the new session GUID
+    local old_guid="$SESSION_GUID"
+    find_session_guid
+    cd "$orig_dir" 2>/dev/null
+    if [[ -z "$SESSION_GUID" ]]; then
+        echo "  Warning: Could not find new session GUID."
+        return 1
+    fi
+
+    # Rewrite sessions.txt: new session at top, old session "(old)" at bottom
+    local tmp="$SESSIONS_FILE.tmp"
+    local old_line=""
+    {
+        # New session first
+        echo "$SESSION_GUID|$cur_dir|$new_name"
+        # Everything else except old session
+        while IFS='|' read -r guid dir desc; do
+            if [[ "$guid" == "$old_guid" ]]; then
+                if [[ "$desc" == *"(old)"* ]]; then
+                    old_line="$guid|$dir|$desc"
+                else
+                    old_line="$guid|$dir|$desc (old)"
+                fi
+            else
+                echo "$guid|$dir|$desc"
+            fi
+        done < "$SESSIONS_FILE"
+        # Old session at bottom
+        [[ -n "$old_line" ]] && echo "$old_line"
+    } > "$tmp"
+    mv "$tmp" "$SESSIONS_FILE"
+    echo ""
+    echo "  Fresh session created: $new_name"
+    echo "  Old session moved to bottom of list."
+}
+
 post_exit() {
     local known_guid="${1:-}"
     if [[ -n "$known_guid" ]]; then
@@ -130,6 +282,19 @@ post_exit() {
         local note_path="$NOTES_DIR/$SESSION_GUID.txt"
         [[ -f "$note_path" ]] || touch "$note_path"
         $EDITOR "$note_path"
+    fi
+
+    # Anti-bloat: trim and refresh options
+    echo ""
+    read -rp "  Trim this session? [y/N]: " do_trim_answer
+    if [[ "${do_trim_answer,,}" == "y" ]]; then
+        do_trim
+    fi
+
+    echo ""
+    read -rp "  Replace current session with a fresh one? (deeper clean) [y/N]: " do_refresh_answer
+    if [[ "${do_refresh_answer,,}" == "y" ]]; then
+        do_refresh
     fi
 }
 
@@ -293,6 +458,19 @@ do_resume() {
     orig_dir=$(pwd)
     cd "$SEL_DIR" || return 1
     "$CLAUDE_EXE" --dangerously-skip-permissions --resume "$SEL_GUID"
+    local claude_rc=$?
+    if [[ $claude_rc -ne 0 ]]; then
+        echo ""
+        read -rp "  Session not found. Delete this entry? [Y/n]: " del_entry
+        if [[ "${del_entry,,}" != "n" ]]; then
+            local tmp="$SESSIONS_FILE.tmp"
+            grep -v "^$SEL_GUID|" "$SESSIONS_FILE" > "$tmp"
+            mv "$tmp" "$SESSIONS_FILE"
+            echo "  Entry removed."
+        fi
+        cd "$orig_dir" || true
+        return 1
+    fi
     post_exit "$SEL_GUID"
     cd "$orig_dir" || true
 }
@@ -393,7 +571,17 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
         read -rp "  Resume this session? [Y/n]: " use_existing
         if [[ "${use_existing,,}" != "n" ]]; then
             "$CLAUDE_EXE" --dangerously-skip-permissions --resume "$MATCH_GUID"
-            post_exit "$MATCH_GUID"
+            if [[ $? -eq 0 ]]; then
+                post_exit "$MATCH_GUID"
+            else
+                echo ""
+                read -rp "  Session not found. Delete this entry? [Y/n]: " del_entry
+                if [[ "${del_entry,,}" != "n" ]]; then
+                    grep -v "^$MATCH_GUID|" "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp"
+                    mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
+                    echo "  Entry removed."
+                fi
+            fi
             [[ -n "$PROJ_DIR" ]] && cd "$ORIG_DIR" 2>/dev/null
             exit 0
         fi
@@ -405,6 +593,12 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
 fi
 
 "$CLAUDE_EXE" --dangerously-skip-permissions "${ARGS[@]}"
+CLAUDE_RC=$?
+
+if [[ $CLAUDE_RC -ne 0 ]]; then
+    [[ -n "$PROJ_DIR" ]] && cd "$ORIG_DIR" 2>/dev/null
+    exit $CLAUDE_RC
+fi
 
 if [[ -n "$PRE_NAMED" ]]; then
     find_session_guid
@@ -416,7 +610,7 @@ if [[ -n "$PRE_NAMED" ]]; then
     echo ""
     read -rp "  Add/edit notes? [y/N]: " edit_notes
     if [[ "${edit_notes,,}" == "y" ]]; then
-        local note_path="$NOTES_DIR/$SESSION_GUID.txt"
+        note_path="$NOTES_DIR/$SESSION_GUID.txt"
         [[ -f "$note_path" ]] || touch "$note_path"
         $EDITOR "$note_path"
     fi

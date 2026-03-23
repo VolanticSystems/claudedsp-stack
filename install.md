@@ -166,6 +166,12 @@ Restart Claude Code, then:
 
 **cmv not found:** Run `npm link` again from the cmv directory, then reopen your terminal.
 
+**PostToolUse:Write hook error (cmv):** Claude Code hooks run in non-interactive shells that don't source `.bashrc`, so custom PATH entries (like `~/.npm-global/bin`) aren't available. Fix: rebuild and re-run postinstall to write the absolute path into the hooks:
+```bash
+cd ~/.claude-plugins/cmv && npm run build && node dist/postinstall.js
+```
+Verify with: `cat ~/.claude/settings.json` (the hook commands should show a full path, not bare `cmv`).
+
 **Claude-Mem worker not starting:** Check that Bun is installed and on your PATH. Run `bun --version` to verify.
 
 **Hooks not firing:** Run `cmv hook status` and check that both PreCompact and PostToolUse show as installed. For Context-Manager, the hooks are registered via the MCP server config.
