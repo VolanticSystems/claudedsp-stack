@@ -256,6 +256,14 @@ do_refresh() {
 }
 
 post_exit() {
+    # Let Claude Code finish its terminal cleanup before we prompt
+    sleep 0.3
+    echo ""
+    echo ""
+    echo ""
+    echo "  Session ended."
+    echo ""
+
     local known_guid="${1:-}"
     if [[ -n "$known_guid" ]]; then
         SESSION_GUID="$known_guid"
