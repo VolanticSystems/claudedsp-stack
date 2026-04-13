@@ -30,35 +30,25 @@ Claude Code identifies sessions with GUIDs. As I mentioned above, when you exit,
     Resume this session with:
     claude --resume a17b8d20-71c1-4eb6-8e7d-438222b649fc
 
-Try managing 20 of those. You can't. But the GUID problem is worse than it looks, because it doesn't just affect the command line. That GUID is also what shows up in your terminal tab title, in the Claude Code app on your phone, and in every window on your screen. I have six monitors. On a busy day I might have four or five Claude sessions running at once. Before I fixed this, they all looked the same. I'd glance at a terminal, have no idea which project it was, and start typing into the wrong session. On the phone it was worse: a wall of hex strings with no way to tell which machine was even running which session.
+Try managing 20 of those. You can't. You forget which GUID was which project, and after three sessions they all blur together.
 
-So I wrote a wrapper called Claude Context Manager (ClaudeCM). It replaces the GUID with a name you choose, and that name follows the session everywhere.
+So I wrote a wrapper called Claude Context Manager (ClaudeCM). It started as a simple session launcher but grew into a full context management tool.
 
-When you launch a session, ClaudeCM sets a display name in the format `machine - project`. My desktop sessions show up as `desktop - YouTube processor`, `desktop - Claude Context Manager`, `desktop - Octane Website`. If I'm checking in from my phone, I see those names instead of GUIDs. If I had sessions running on a laptop too, they'd show as `laptop - whatever`. At a glance, from any device, I know what's running where.
+By default, Claude Context Manager launches Claude with `--dangerously-skip-permissions`. I make sure I have rock solid daily backups, and by trusting Claude, I avoid having to hit "yes" 400 times a day. If you prefer a more conservative approach, you can change the script to omit that flag; Claude will prompt for approval on each tool use, and you can always press Shift+Tab to toggle permissions on the fly.
 
-On the terminal side, the effect is immediate. Right now I've got two windows open. One says "Claude Context Manager" in the tab. The other says "YouTube processor." I never mix them up. That sounds trivial until you've pasted a database migration command into the wrong project because both tabs said `claude --resume a17b8d20`.
+Claude Context Manager gives you:
 
-By default, ClaudeCM launches Claude with `--dangerously-skip-permissions`. I make sure I have rock solid daily backups, and by trusting Claude, I avoid having to hit "yes" 400 times a day. If you prefer a more conservative approach, you can change the script to omit that flag; Claude will prompt for approval on each tool use, and you can always press Shift+Tab to toggle permissions on the fly.
+- **Named sessions.** I have an option "claudecm l" or --l which lists all the named sessions I'm working on, in the order that they were most recently used.
 
-ClaudeCM gives you:
+- **Resume by number.** claudecm 3 gets you back into session 3. One command.
 
-- **Named sessions everywhere.** You pick the name. It shows up in your terminal tab, in the Claude app on your phone, in the session list. `claudecm l` shows all your named sessions in most-recently-used order. No more hex strings, anywhere.
+- **Session detection.** Run claudecm in a project directory and it finds your existing session automatically. If there is no session found, it offers you the option of adding a session name
 
-- **Resume by number.** `claudecm 3` gets you back into session 3. One command.
+- **Orphan detection.** On every resume, Claude Context Manager scans for stray conversation files that don't belong. You see exactly what's in the project directory and can quarantine anything that shouldn't be there, before it causes the wrong session to load.
 
-- **Session detection.** Run `claudecm` in a project directory and it finds your existing session automatically. No session found? It offers to create one with a name you choose.
+- **Inline editing of sessions.** When listing sessions, you can also rename the session, change paths, or delete the session record (doesn't touch files) without messing around with raw config files.
 
-- **Orphan detection.** On every resume, ClaudeCM scans for stray conversation files that don't belong. You see exactly what's in the project directory and can quarantine anything that shouldn't be there, before it causes the wrong session to load.
-
-- **Session index sync.** Claude Code's built-in `/resume` picker relies on an internal index that is undocumented and frequently broken. ClaudeCM validates and repairs it on every operation, so the picker stays functional even after renames, quarantines, and refreshes.
-
-- **Inline editing.** Rename, reorder, change paths, archive, or permanently delete sessions, all from one menu.
-
-- **Archive and delete.** Archive moves a session off the active list but keeps all files on disk. View and unarchive any time from the session list. Delete is permanent: it removes the session entry, the JSONL conversation file, and associated data. Requires typing "delete" to confirm. Two levels of cleanup for two different needs.
-
-- **Transcript protection.** Claude Code defaults to deleting your session transcripts after 30 days. No warning, no prompt, no way to recover them. ClaudeCM sets `cleanupPeriodDays` to 100,000 on first launch (about 274 years), so your conversations stay on disk until you decide otherwise. If a transcript has already been lost, picking that session gives you three options: start fresh, generate a `recovery-prompt.md` file for that project (ClaudeCM writes it from the surviving memory files and subagent state; you edit it if you want, then paste it as the first message of a new session), or cancel. Existing `recovery-prompt.md` files get rotated to `.old`, `.old2`, etc., so nothing is overwritten.
-
-- **Concurrency-safe.** Built for users who run multiple Claude sessions in parallel windows. ClaudeCM never uses CMV's `--latest` selector (which picks globally across all projects and silently grabs the wrong session), never scans across project directories for "the newest file," and never silently copies JSONLs between projects. Every session is identified by a specific GUID resolved through three independent layers: the `~/.claude/sessions/<pid>.json` manifest, a project-scoped JSONL snapshot diff, and a project-scoped fallback. If any two layers disagree, ClaudeCM warns loudly. The `sessions.txt` registry uses file locking and atomic rename writes so two parallel ClaudeCM operations cannot corrupt each other's changes.
+- **Remote display names.** Every session launches with a display name in the format `machine - project` (e.g., `desktop - YouTube processor`). If you use the Claude Code app on your phone or another machine, you can tell at a glance which session is running where. On first launch, Claude Context Manager asks for a machine name; change it any time from the session list menu.
 
 It's a PowerShell function on Windows, or a bash script on Linux. Once it is set up, you are done.
 

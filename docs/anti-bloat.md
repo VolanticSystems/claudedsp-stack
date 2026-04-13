@@ -1,8 +1,8 @@
-# Anti-Bloat Strategy for ClaudeDSP Sessions
+# Anti-Bloat Strategy for Claude Context Manager Sessions
 
 ## The Problem
 
-Long-running ClaudeDSP sessions accumulate context that costs tokens on every resume. Sources of bloat:
+Long-running Claude Context Manager sessions accumulate context that costs tokens on every resume. Sources of bloat:
 
 1. **Conversation history**: debugging sessions, monitoring runs, repeated tool outputs, arguments, dead-end explorations. Most of this is noise after the work is done.
 
@@ -18,9 +18,9 @@ In the zoom-away project, a cron monitoring job resuming a large Opus conversati
 
 ## Solutions
 
-### 1. Session Trimming at Exit (IMPLEMENTED in claudedsp)
+### 1. Session Trimming at Exit (IMPLEMENTED in claudecm)
 
-When you exit a session, ClaudeDSP prompts:
+When you exit a session, Claude Context Manager prompts:
 
 ```
 Trim this session? [y/N]:
@@ -58,7 +58,7 @@ For automated monitoring (e.g., checking if recordings are running):
 - If Claude is needed, use a separate session dedicated to monitoring, on Haiku (not Opus). Fresh context, minimal history.
 - Store the monitoring prompt in a file (e.g., `cronjob.md`) and pass it with `--file`. The prompt is the only context; no conversation history accumulates.
 
-Pattern for `claudedsp-headless`:
+Pattern for `claudecm-headless`:
 ```bash
 # Check if there's anything to monitor
 if ! docker ps --filter "name=zoom-away" --quiet | grep -q .; then
@@ -103,9 +103,9 @@ Desired instrumentation:
 
 This would require either Claude Code exposing token metrics, or building an approximation by measuring the JSONL transcript file size and estimating tokens (roughly 4 chars per token).
 
-### 6. Session Refresh (IMPLEMENTED in claudedsp)
+### 6. Session Refresh (IMPLEMENTED in claudecm)
 
-After the trim prompt, ClaudeDSP also offers:
+After the trim prompt, Claude Context Manager also offers:
 
 ```
 Replace current session with a fresh one? (deeper clean) [y/N]:
@@ -122,8 +122,8 @@ This complements trim: trim reduces an existing session's bloat, while refresh s
 
 ## Implementation Status
 
-1. ~~Add trim prompt to claudedsp exit flow~~ DONE
-2. ~~Add refresh/new session to claudedsp exit flow~~ DONE
+1. ~~Add trim prompt to claudecm exit flow~~ DONE
+2. ~~Add refresh/new session to claudecm exit flow~~ DONE
 3. **Rewrite cron jobs to use fresh Haiku invocations** (stops the bleed)
 4. **Add token estimation from transcript file size** (nice to have, helps make informed decisions)
 5. **Plugin hygiene review across all sessions** (periodic, low priority)

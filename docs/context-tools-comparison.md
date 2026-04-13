@@ -266,7 +266,7 @@ Tools that complement each other well can be stacked. The table below is ordered
 | Rank | Tool | Why | Install Effort | Stacks With |
 |------|------|-----|---------------|-------------|
 | 1 | **Context-Manager** | Already installed. Automatic compaction protection with zero manual work. The dedup and failure-tracking hooks prevent context waste before it happens. Foundation layer. | Done | Everything |
-| 2 | **CMV** | Best-in-class context reduction with formal guarantees. Snapshot/restore model fits naturally with ClaudeDSP's session management. The virtual memory metaphor matches how you already think about sessions. | Medium | Context-Manager, Memory Keeper |
+| 2 | **CMV** | Best-in-class context reduction with formal guarantees. Snapshot/restore model fits naturally with Claude Context Manager's session management. The virtual memory metaphor matches how you already think about sessions. | Medium | Context-Manager, Memory Keeper |
 | 3 | **Claude-Mem** | AI-compressed cross-session memory without manual work. Endless Mode directly addresses the "runs out of context right when you're about to code" problem. | Low | Context-Manager, CMV |
 | 4 | **Memory Keeper** | Solid cross-session persistence with git integration. Good for projects where you return weeks later and need to remember architectural decisions. SQLite is reliable. | Low | Context-Manager, Claude-Mem |
 | 5 | **Claude Context** | Worth it for large codebases where semantic search beats grep. The 40% token reduction is real savings. Not a context-preservation tool but reduces how much context you need in the first place. | Medium (needs embedding API) | Everything |
@@ -277,7 +277,7 @@ Tools that complement each other well can be stacked. The table below is ordered
 
 ### Recommended Stack for Your Setup
 
-Given that you run 20+ projects, switch between them constantly via ClaudeDSP, and hit compaction regularly:
+Given that you run 20+ projects, switch between them constantly via Claude Context Manager, and hit compaction regularly:
 
 1. **Context-Manager** (already installed) — baseline compaction protection
 2. **CMV** — add snapshot/restore that integrates with your session management workflow

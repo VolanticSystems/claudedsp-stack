@@ -1,4 +1,5 @@
-node_modules/
+private/
+.claude/
+*.oldturd
 *.tmp
-.DS_Store
-Thumbs.db
+*.bak

@@ -24,7 +24,7 @@ Bun is a JavaScript runtime (like Node.js) that Claude-Mem uses for one reason: 
 
 **Security:** The worker listens on `127.0.0.1:37777` (localhost only) by default. External connections are impossible at the OS level. No firewall changes are needed. Do not change `CLAUDE_MEM_WORKER_HOST` to `0.0.0.0` unless you have a specific reason and understand the implications.
 
-## Step 1: ClaudeDSP (Session Manager)
+## Step 1: Claude Context Manager (Session Manager)
 
 ### Windows (PowerShell)
 
@@ -34,11 +34,11 @@ Bun is a JavaScript runtime (like Node.js) that Claude-Mem uses for one reason: 
    ```
    If the file doesn't exist, PowerShell will ask to create it. Say yes.
 
-2. Paste the entire contents of `claudedsp-powershell.ps1` into your profile.
+2. Paste the entire contents of `claudecm-powershell.ps1` into your profile.
 
 3. Save and open a new PowerShell window. The old window won't see the changes.
 
-4. Type `claudedsp` to launch Claude Code with session management.
+4. Type `claudecm` to launch Claude Code with session management.
 
 ### Linux
 
@@ -50,13 +50,13 @@ Bun is a JavaScript runtime (like Node.js) that Claude-Mem uses for one reason: 
 
 2. Copy the script:
    ```bash
-   sudo cp claudedsp-linux.sh /usr/local/bin/claudedsp
-   sudo chmod +x /usr/local/bin/claudedsp
+   sudo cp claudecm-linux.sh /usr/local/bin/claudecm
+   sudo chmod +x /usr/local/bin/claudecm
    ```
 
 3. If using the `claude` user, make sure Claude Code is installed for that user and the `claude` user has access to your project directories.
 
-4. Type `claudedsp` to launch Claude Code with session management.
+4. Type `claudecm` to launch Claude Code with session management.
 
 ## Step 2: Context-Manager (Layer 1, Compaction Insurance)
 
@@ -163,8 +163,8 @@ Restart Claude Code, then:
 1. Run `/mcp` and confirm both `context-manager` and `claude-mem` appear and show connected. (CMV is a CLI tool, not an MCP server; it won't appear in this list.)
 2. Run `cmv hook status` in a terminal to confirm CMV hooks are installed.
 3. Run `cmv --version` to confirm it's accessible.
-4. Start a session with `claudedsp` and work normally. The tools run automatically in the background.
-5. When you exit the session, ClaudeDSP will prompt you to:
+4. Start a session with `claudecm` and work normally. The tools run automatically in the background.
+5. When you exit the session, ClaudeCM will prompt you to:
    - Add/edit notes for next time
    - **Trim** the session (strips tool output bloat, keeps your conversation)
    - **Refresh** the session (starts completely fresh, old session preserved and accessible)
