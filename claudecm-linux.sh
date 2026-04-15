@@ -1,659 +1,734 @@
-#!/bin/bash
-# ClaudeCM - Claude Context Manager (Linux/macOS)
-# See claudecm-project-spec.md for the canonical specification.
+#!/usr/bin/env bash
+# claudecm-linux.sh - Claude Context Manager for Linux / macOS
 #
-# Install:
-#   cp claudecm-linux.sh /usr/local/bin/claudecm
-#   chmod +x /usr/local/bin/claudecm
+# Conforms to claudecm-project-spec.md. Port of claudecm-powershell.ps1.
+# Source this file from ~/.bashrc or ~/.zshrc to get the `claudecm` function.
 #
-# Usage:
-#   claudecm                       Launch Claude in the current directory
-#   claudecm l                     List saved sessions (interactive picker)
-#   claudecm 3                     Resume session #3
-#   claudecm --proj /path/to/dir   Operate in a specific project directory
+# Dependencies: claude (required), jq or node (for JSON), flock (util-linux),
+# cmv (optional; snapshot/trim/refresh degrade gracefully if missing).
+#
+# NOTE: This script has not been tested on a real Linux system. It is a
+# faithful port of the PowerShell implementation, built from the spec.
+# Exercise caution and verify behavior before relying on it.
 
-set -u
+# ==================================================================
+# Color helpers
+# ==================================================================
+__CM_C_RESET=$'\033[0m'
+__CM_C_RED=$'\033[31m'
+__CM_C_GREEN=$'\033[32m'
+__CM_C_YELLOW=$'\033[33m'
+__CM_C_CYAN=$'\033[36m'
+__CM_C_DARKGRAY=$'\033[90m'
 
-# --- Bootstrap (Section 4) ---
-export CLAUDE_CODE_REMOTE_SEND_KEEPALIVES=1
+__cm_say()     { printf '  %s\n' "$*"; }
+__cm_say_c()   { local c="$1"; shift; printf '  %b%s%b\n' "$c" "$*" "$__CM_C_RESET"; }
+__cm_blank()   { printf '\n'; }
 
-CM_DIR="$HOME/.claudecm"
-SESSIONS_FILE="$CM_DIR/sessions.txt"
-SESSIONS_LOCK="$CM_DIR/sessions.txt.lock"
-MACHINE_NAME_FILE="$CM_DIR/machine-name.txt"
-BACKUP_DIR="$CM_DIR/backup"
-REFRESH_TEMP_ROOT="$CM_DIR/refresh-temp"
+# ==================================================================
+# Paths and executable lookup
+# ==================================================================
+__cm_cm_dir="$HOME/.claudecm"
+__cm_sessions_file="$__cm_cm_dir/sessions.txt"
+__cm_lock_file="$__cm_sessions_file.lock"
+__cm_tmp_file="$__cm_sessions_file.tmp"
+__cm_machine_name_file="$__cm_cm_dir/machine-name.txt"
+__cm_backup_dir="$__cm_cm_dir/backup"
+__cm_quarantine_root="$HOME/claude-conversation-backup"
 
-CLAUDE_EXE="$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")"
-CMV_EXE="$(command -v cmv 2>/dev/null || echo "$HOME/.npm-global/bin/cmv")"
-NODE_EXE="$(command -v node 2>/dev/null || true)"
-EDITOR="${EDITOR:-nano}"
-
-mkdir -p "$CM_DIR" "$BACKUP_DIR"
-[[ -f "$SESSIONS_FILE" ]] || touch "$SESSIONS_FILE"
-
-# Color helpers (no-op when not a TTY)
-if [[ -t 1 ]]; then
-    C_RESET='\033[0m'
-    C_RED='\033[0;31m'
-    C_GREEN='\033[0;32m'
-    C_YELLOW='\033[0;33m'
-    C_CYAN='\033[0;36m'
-    C_GRAY='\033[0;90m'
-else
-    C_RESET=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_GRAY=''
-fi
-
-# --- Section 4 step 4: Ensure cleanupPeriodDays ---
-ensure_cleanup_period_days() {
-    local settings="$HOME/.claude/settings.json"
-    [[ -f "$settings" ]] || return 0
-    [[ -n "$NODE_EXE" ]] || return 0
-    "$NODE_EXE" -e "
-        const fs = require('fs');
-        const p = '$settings';
-        try {
-            const s = JSON.parse(fs.readFileSync(p, 'utf8'));
-            if (!s.cleanupPeriodDays || s.cleanupPeriodDays < 1000) {
-                const ts = new Date().toISOString().replace(/[-:T.]/g, '').slice(0,15);
-                fs.copyFileSync(p, '$BACKUP_DIR/settings.json.' + ts);
-                s.cleanupPeriodDays = 100000;
-                fs.writeFileSync(p, JSON.stringify(s, null, 2));
-                console.log('  Protected session transcripts from Claude Code\\'s 30-day auto-delete.');
-            }
-        } catch(e) {}
-    " 2>/dev/null
-}
-ensure_cleanup_period_days
-
-# Auto-backup sessions.txt on every launch (best-effort, silent).
-# Keeps a rolling history of the last 20 backups.
-auto_backup_sessions() {
-    [[ -s "$SESSIONS_FILE" ]] || return 0
-    mkdir -p "$BACKUP_DIR"
-    local ts
-    ts=$(date +%Y%m%d-%H%M%S)
-    cp "$SESSIONS_FILE" "$BACKUP_DIR/sessions.txt.$ts" 2>/dev/null
-    # Prune all but the most recent 20
-    ls -1t "$BACKUP_DIR"/sessions.txt.* 2>/dev/null | tail -n +21 | while read -r old; do
-        rm -f "$old"
+__cm_find_exe() {
+    # Returns first existing/on-PATH executable from the candidate list.
+    local c
+    for c in "$@"; do
+        if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
+        if [[ -x "$c" ]]; then printf '%s\n' "$c"; return 0; fi
     done
-}
-auto_backup_sessions
-
-# --- Section 4 step 5: Machine name bootstrap ---
-if [[ ! -f "$MACHINE_NAME_FILE" ]]; then
-    echo ""
-    read -rp "  Machine name for remote display (e.g. desktop, laptop): " mn
-    [[ -z "$mn" ]] && mn=$(hostname | tr '[:upper:]' '[:lower:]')
-    echo "$mn" > "$MACHINE_NAME_FILE"
-    echo "  Saved: $mn"
-fi
-MACHINE_NAME=$(tr -d '\n' < "$MACHINE_NAME_FILE" 2>/dev/null)
-[[ -z "$MACHINE_NAME" ]] && MACHINE_NAME=$(hostname | tr '[:upper:]' '[:lower:]')
-
-# --- Section 6: Project key encoding ---
-get_proj_key() {
-    # Replace every non-alphanumeric character with dash.
-    echo "$1" | sed 's|[^a-zA-Z0-9]|-|g'
-}
-
-get_display_name() {
-    echo "$MACHINE_NAME - $1"
-}
-
-# --- Section 5: sessions.txt I/O ---
-get_sessions() {
-    # Emit lines: index|guid|dir|desc|tokens (stops at [archived])
-    local i=0
-    while IFS='|' read -r guid dir desc tokens; do
-        [[ -z "$guid" ]] && continue
-        [[ "$guid" == "[archived]" ]] && break
-        echo "$i|$guid|$dir|$desc|$tokens"
-        ((i++))
-    done < "$SESSIONS_FILE"
-}
-
-get_archived_sessions() {
-    local i=0 in_archived=false
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        if [[ "$line" == "[archived]" ]]; then in_archived=true; continue; fi
-        if $in_archived; then
-            IFS='|' read -r guid dir desc tokens <<< "$line"
-            [[ -z "$guid" ]] && continue
-            echo "$i|$guid|$dir|$desc|$tokens"
-            ((i++))
-        fi
-    done < "$SESSIONS_FILE"
-}
-
-get_session_count() {
-    local count=0
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        [[ "$line" == "[archived]" ]] && break
-        ((count++))
-    done < "$SESSIONS_FILE"
-    echo "$count"
-}
-
-# --- Section 5.1: locking + atomic write ---
-acquire_sessions_lock() {
-    # Opens FD 9 on the lock file with exclusive lock. Retries up to 10s.
-    # Returns 0 if acquired, 1 if not (caller proceeds without lock).
-    if command -v flock >/dev/null 2>&1; then
-        exec 9>"$SESSIONS_LOCK"
-        if flock -w 10 9 2>/dev/null; then
-            return 0
-        else
-            echo "  [warning] Could not acquire sessions.txt lock after 10s; proceeding without lock."
-            return 1
-        fi
-    fi
-    return 0
-}
-
-release_sessions_lock() {
-    if command -v flock >/dev/null 2>&1; then
-        flock -u 9 2>/dev/null || true
-        exec 9>&-
-    fi
-}
-
-write_sessions_atomic() {
-    # Reads all lines from stdin, writes to .tmp, renames atomically.
-    local tmp="$SESSIONS_FILE.tmp"
-    cat > "$tmp"
-    mv "$tmp" "$SESSIONS_FILE"
-}
-
-save_sessions() {
-    # Reads main session lines from stdin. Preserves [archived] section.
-    acquire_sessions_lock
-    local main_tmp arch_tmp
-    main_tmp=$(mktemp); arch_tmp=$(mktemp)
-    cat > "$main_tmp"
-    local in_archived=false
-    while IFS= read -r line; do
-        if [[ "$line" == "[archived]" ]]; then in_archived=true; continue; fi
-        if $in_archived && [[ -n "$line" ]]; then echo "$line" >> "$arch_tmp"; fi
-    done < "$SESSIONS_FILE"
-    {
-        cat "$main_tmp"
-        if [[ -s "$arch_tmp" ]]; then
-            echo "[archived]"
-            cat "$arch_tmp"
-        fi
-    } | write_sessions_atomic
-    rm -f "$main_tmp" "$arch_tmp"
-    release_sessions_lock
-}
-
-save_archived_sessions() {
-    # Reads archived session lines from stdin. Preserves main section.
-    acquire_sessions_lock
-    local arch_tmp main_tmp
-    arch_tmp=$(mktemp); main_tmp=$(mktemp)
-    cat > "$arch_tmp"
-    while IFS= read -r line; do
-        [[ "$line" == "[archived]" ]] && break
-        [[ -n "$line" ]] && echo "$line" >> "$main_tmp"
-    done < "$SESSIONS_FILE"
-    {
-        cat "$main_tmp"
-        if [[ -s "$arch_tmp" ]]; then
-            echo "[archived]"
-            cat "$arch_tmp"
-        fi
-    } | write_sessions_atomic
-    rm -f "$arch_tmp" "$main_tmp"
-    release_sessions_lock
-}
-
-# --- Section 7: formatting helpers ---
-format_tokens() {
-    local t="$1"
-    if [[ -z "$t" ]]; then echo "--"; return; fi
-    if (( t >= 1000000 )); then awk "BEGIN{printf \"%.1fM tok\", $t/1000000}"
-    elif (( t >= 1000 )); then awk "BEGIN{printf \"%.0fK tok\", $t/1000}"
-    else echo "${t} tok"
-    fi
-}
-
-format_size() {
-    local b="$1"
-    if (( b >= 1048576 )); then awk "BEGIN{printf \"%.1f MB\", $b/1048576}"
-    elif (( b >= 1024 )); then awk "BEGIN{printf \"%.0f KB\", $b/1024}"
-    else echo "${b} B"
-    fi
-}
-
-format_date_short() {
-    # Input: epoch seconds. Output: "Mar 13" (current year) or "Mar 13, 2026" (older).
-    local epoch="$1"
-    local cur_year file_year
-    cur_year=$(date +%Y)
-    file_year=$(date -d "@$epoch" +%Y 2>/dev/null || date -r "$epoch" +%Y 2>/dev/null)
-    if [[ "$file_year" -lt "$cur_year" ]]; then
-        date -d "@$epoch" "+%b %d, %Y" 2>/dev/null || date -r "$epoch" "+%b %d, %Y"
-    else
-        date -d "@$epoch" "+%b %d" 2>/dev/null || date -r "$epoch" "+%b %d"
-    fi
-}
-
-# --- Section 8: get_session_info ---
-get_session_info() {
-    # Args: guid dir tokens. Output: size|date|tokens|status
-    local guid="$1" dir="$2" tokens="$3"
-    local proj_key proj_dir jsonl
-    proj_key=$(get_proj_key "$dir")
-    proj_dir="$HOME/.claude/projects/$proj_key"
-    jsonl="$proj_dir/$guid.jsonl"
-
-    local tok_str
-    tok_str=$(format_tokens "${tokens:-}")
-
-    if [[ -f "$jsonl" ]]; then
-        local bytes mtime size_str date_str
-        bytes=$(stat -c%s "$jsonl" 2>/dev/null || stat -f%z "$jsonl" 2>/dev/null)
-        mtime=$(stat -c%Y "$jsonl" 2>/dev/null || stat -f%m "$jsonl" 2>/dev/null)
-        size_str=$(format_size "$bytes")
-        date_str=$(format_date_short "$mtime")
-        echo "$size_str|$date_str|$tok_str|ok"
-        return
-    fi
-
-    # JSONL missing - try fallbacks for date
-    local fb_mtime=""
-    if [[ -d "$proj_dir/$guid" ]]; then
-        fb_mtime=$(stat -c%Y "$proj_dir/$guid" 2>/dev/null || stat -f%m "$proj_dir/$guid" 2>/dev/null)
-    elif [[ -d "$proj_dir/memory" ]]; then
-        fb_mtime=$(stat -c%Y "$proj_dir/memory" 2>/dev/null || stat -f%m "$proj_dir/memory" 2>/dev/null)
-    elif [[ -f "$proj_dir/sessions-index.json" && -n "$NODE_EXE" ]]; then
-        fb_mtime=$("$NODE_EXE" -e "
-            try {
-                const idx = JSON.parse(require('fs').readFileSync('$proj_dir/sessions-index.json', 'utf8'));
-                const e = (idx.entries||[]).find(x => x.sessionId === '$guid');
-                if (e && e.created) console.log(Math.floor(new Date(e.created).getTime() / 1000));
-            } catch(e) {}
-        " 2>/dev/null)
-    fi
-
-    local date_str="--"
-    if [[ -n "$fb_mtime" ]]; then
-        date_str="$(format_date_short "$fb_mtime")*"
-    fi
-    echo "(missing)|$date_str|$tok_str|missing"
-}
-
-# --- Section 10: Sync-SessionIndex ---
-sync_session_index() {
-    local project_dir="$1"
-    [[ -z "$project_dir" ]] && return
-    [[ -n "$NODE_EXE" ]] || return
-    local proj_key proj_dir_claude
-    proj_key=$(get_proj_key "$project_dir")
-    proj_dir_claude="$HOME/.claude/projects/$proj_key"
-    [[ -d "$proj_dir_claude" ]] || return
-
-    "$NODE_EXE" -e "
-const fs = require('fs');
-const path = require('path');
-const projDirClaude = process.argv[1];
-const projectDir = process.argv[2];
-const sessionsFile = process.argv[3];
-const indexPath = path.join(projDirClaude, 'sessions-index.json');
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$/;
-
-const sessionsMap = {};
-try {
-  fs.readFileSync(sessionsFile, 'utf8').split('\n').forEach(line => {
-    if (!line.trim() || line.startsWith('[')) return;
-    const p = line.split('|');
-    if (p.length >= 3) sessionsMap[p[0]] = { dir: p[1], desc: p[2] };
-  });
-} catch(e) {}
-
-let jsonlFiles = [];
-try {
-  jsonlFiles = fs.readdirSync(projDirClaude)
-    .filter(f => f.endsWith('.jsonl') && UUID_RE.test(path.basename(f, '.jsonl')))
-    .map(f => {
-      const fp = path.join(projDirClaude, f);
-      const st = fs.statSync(fp);
-      return { guid: path.basename(f, '.jsonl'), fullPath: fp, stat: st };
-    });
-} catch(e) { return; }
-if (jsonlFiles.length === 0) return;
-
-let existing = [];
-let originalPath = projectDir;
-if (fs.existsSync(indexPath)) {
-  try {
-    const idx = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
-    existing = idx.entries || [];
-    if (idx.originalPath) originalPath = idx.originalPath;
-  } catch(e) {}
-}
-
-const onDisk = {};
-for (const f of jsonlFiles) onDisk[f.guid] = f;
-const valid = existing.filter(e => onDisk[e.sessionId]);
-for (const e of valid) {
-  const f = onDisk[e.sessionId];
-  e.fileMtime = Math.round(f.stat.mtimeMs);
-  e.modified = f.stat.mtime.toISOString();
-}
-const indexed = new Set(valid.map(e => e.sessionId));
-const fresh = [];
-for (const f of jsonlFiles) {
-  if (indexed.has(f.guid)) continue;
-  const info = sessionsMap[f.guid];
-  fresh.push({
-    sessionId: f.guid,
-    fullPath: f.fullPath,
-    fileMtime: Math.round(f.stat.mtimeMs),
-    firstPrompt: info ? info.desc : '',
-    messageCount: 0,
-    created: (f.stat.birthtime || f.stat.mtime).toISOString(),
-    modified: f.stat.mtime.toISOString(),
-    gitBranch: '',
-    projectPath: info ? info.dir : originalPath,
-    isSidechain: false
-  });
-}
-const out = { version: 1, entries: [...valid, ...fresh], originalPath };
-fs.writeFileSync(indexPath, JSON.stringify(out, null, 2));
-" "$proj_dir_claude" "$project_dir" "$SESSIONS_FILE" 2>/dev/null
-}
-
-# --- Section 9: Show-List ---
-show_list() {
-    local highlight="${1:-0}"
-    echo ""
-    echo "  === Saved Sessions ==="
-    echo ""
-    local i=0 max_desc=0 count
-    count=$(get_session_count)
-    while IFS='|' read -r guid dir desc tokens; do
-        [[ -z "$guid" ]] && continue
-        [[ "$guid" == "[archived]" ]] && break
-        local len=${#desc}
-        (( len > max_desc )) && max_desc=$len
-    done < "$SESSIONS_FILE"
-    (( max_desc < 10 )) && max_desc=10
-    local num_width=${#count}
-
-    while IFS='|' read -r guid dir desc tokens; do
-        [[ -z "$guid" ]] && continue
-        [[ "$guid" == "[archived]" ]] && break
-        ((i++))
-        local info size_str date_str tok_str status
-        info=$(get_session_info "$guid" "$dir" "${tokens:-}")
-        IFS='|' read -r size_str date_str tok_str status <<< "$info"
-        local num_str="${i}."
-        printf -v line "  %-$((num_width + 2))s %-$((max_desc + 2))s %9s  %10s   %s\t%s" "$num_str" "$desc" "$size_str" "$tok_str" "$date_str" "$dir"
-        if [[ "$i" == "$highlight" ]]; then
-            printf "${C_YELLOW}  *** %-$((num_width + 2))s %-$((max_desc + 2))s %9s  %10s   %s\t%s  [Selected] ***${C_RESET}\n" "$num_str" "$desc" "$size_str" "$tok_str" "$date_str" "$dir"
-        else
-            echo "$line"
-        fi
-    done < "$SESSIONS_FILE"
-
-    echo ""
-    local arch_count
-    arch_count=$(get_archived_sessions | wc -l)
-    echo "  E. Edit this list"
-    [[ $arch_count -gt 0 ]] && echo "  V. View archived ($arch_count)"
-    echo "  M. Machine name ($MACHINE_NAME)"
-}
-
-# --- Section 11.5: Do-OrphanScan ---
-ORPHAN_SELECTED_GUID=""
-do_orphan_scan() {
-    ORPHAN_SELECTED_GUID=""
-    local scan_dir="$1" registered_guid="${2:-}"
-    local proj_key proj_dir_claude
-    proj_key=$(get_proj_key "$scan_dir")
-    proj_dir_claude="$HOME/.claude/projects/$proj_key"
-    [[ -d "$proj_dir_claude" ]] || return 1
-
-    local files=()
-    while IFS= read -r f; do files+=("$f"); done < <(ls -t "$proj_dir_claude"/*.jsonl 2>/dev/null)
-    [[ ${#files[@]} -le 1 ]] && return 1
-
-    local has_problems=false f guid match_dir
-    for f in "${files[@]}"; do
-        guid=$(basename "$f" .jsonl)
-        local match
-        match=$(grep "^$guid|" "$SESSIONS_FILE" 2>/dev/null | head -1)
-        if [[ -z "$match" ]]; then has_problems=true; break; fi
-        match_dir=$(echo "$match" | cut -d'|' -f2)
-        if [[ "$match_dir" != "$scan_dir" ]]; then has_problems=true; break; fi
-    done
-    $has_problems || return 1
-
-    local backup_root="$HOME/claude-conversation-backup"
-    echo ""
-    printf "${C_YELLOW}  Multiple conversation files found (%d):${C_RESET}\n" "${#files[@]}"
-    echo ""
-    echo "  #   Last Modified          Size     Session Name"
-    echo "  --- --------------------  --------  ---------------------------"
-
-    local ci=0
-    for f in "${files[@]}"; do
-        ((ci++))
-        guid=$(basename "$f" .jsonl)
-        local bytes mtime size_str date_str name_str="(orphan)" match
-        bytes=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
-        mtime=$(stat -c%Y "$f" 2>/dev/null || stat -f%m "$f" 2>/dev/null)
-        size_str=$(format_size "$bytes")
-        date_str=$(date -d "@$mtime" "+%Y-%m-%d %H:%M" 2>/dev/null || date -r "$mtime" "+%Y-%m-%d %H:%M")
-        match=$(grep "^$guid|" "$SESSIONS_FILE" 2>/dev/null | head -1)
-        if [[ -n "$match" ]]; then
-            name_str=$(echo "$match" | cut -d'|' -f3)
-            local mdir; mdir=$(echo "$match" | cut -d'|' -f2)
-            [[ "$mdir" != "$scan_dir" ]] && name_str="$name_str (wrong directory)"
-        fi
-        local marker=""
-        [[ "$guid" == "$registered_guid" ]] && marker=" *"
-        printf "  %-3s %s  %8s  %s%s\n" "${ci}." "$date_str" "$size_str" "$name_str" "$marker"
-    done
-
-    echo ""
-    echo "  * = registered session for this directory"
-    echo ""
-    echo "  Actions: [number] to select, [q number] to quarantine to backup, [Enter] to continue with registered session"
-    read -rp "  > " orphan_cmd
-
-    if [[ "$orphan_cmd" =~ ^[0-9]+$ ]]; then
-        local idx=$((orphan_cmd - 1))
-        if (( idx >= 0 && idx < ${#files[@]} )); then
-            ORPHAN_SELECTED_GUID=$(basename "${files[$idx]}" .jsonl)
-            return 0
-        fi
-        echo "  Invalid number."
-    elif [[ "$orphan_cmd" =~ ^[qQ][[:space:]]*([0-9]+)$ ]]; then
-        local idx=$((${BASH_REMATCH[1]} - 1))
-        if (( idx >= 0 && idx < ${#files[@]} )); then
-            f="${files[$idx]}"
-            guid=$(basename "$f" .jsonl)
-            if [[ "$guid" == "$registered_guid" ]]; then
-                printf "${C_RED}  Cannot quarantine the registered session.${C_RESET}\n"
-            else
-                local dest_subdir="$backup_root/$(basename "$scan_dir")"
-                mkdir -p "$dest_subdir"
-                mv "$f" "$dest_subdir/"
-                local guid_dir="$proj_dir_claude/$guid"
-                [[ -d "$guid_dir" ]] && mv "$guid_dir" "$dest_subdir/"
-                sync_session_index "$scan_dir"
-                printf "${C_GREEN}  Quarantined to backup: %s/%s${C_RESET}\n" "$(basename "$scan_dir")" "$guid"
-            fi
-        else
-            echo "  Invalid number."
-        fi
-    fi
     return 1
 }
 
-# --- Section 11.6: Invoke-ClaudeLaunch (the only sanctioned launch path) ---
-LAUNCH_PID=""
-LAUNCH_SESSION_ID=""
-LAUNCH_EXIT_CODE=0
-invoke_claude_launch() {
-    # Args: --dir <session_dir> -- <claude args...>
-    LAUNCH_PID=""
-    LAUNCH_SESSION_ID=""
-    LAUNCH_EXIT_CODE=0
+__cm_resolve_claude()  { __cm_find_exe claude "$HOME/.local/bin/claude"; }
+__cm_resolve_cmv()     { __cm_find_exe cmv "$HOME/.npm-global/bin/cmv"; }
+__cm_resolve_node()    { __cm_find_exe node; }
+__cm_resolve_jq()      { __cm_find_exe jq; }
 
-    local session_dir="" args=()
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dir) session_dir="$2"; shift 2 ;;
-            --) shift; args=("$@"); break ;;
-            *) args+=("$1"); shift ;;
-        esac
-    done
-
-    local proj_key proj_dir_claude
-    proj_key=$(get_proj_key "$session_dir")
-    proj_dir_claude="$HOME/.claude/projects/$proj_key"
-    local uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-
-    # Layer 2 setup: snapshot existing GUIDs in this project dir
-    local before_guids="" g
-    if [[ -d "$proj_dir_claude" ]]; then
-        for f in "$proj_dir_claude"/*.jsonl; do
-            [[ -f "$f" ]] || continue
-            g=$(basename "$f" .jsonl)
-            [[ "$g" =~ $uuid_re ]] && before_guids+="$g "
-        done
-    fi
-
-    # Launch claude as a child process; capture PID
-    "$CLAUDE_EXE" "${args[@]}" &
-    LAUNCH_PID=$!
-
-    # Layer 1: poll for the session manifest written by claude.exe
-    local manifest="$HOME/.claude/sessions/$LAUNCH_PID.json"
-    local deadline=$((SECONDS + 5))
-    while (( SECONDS < deadline )); do
-        if [[ -f "$manifest" && -n "$NODE_EXE" ]]; then
-            local sid
-            sid=$("$NODE_EXE" -e "
-                try {
-                    const m = JSON.parse(require('fs').readFileSync('$manifest', 'utf8'));
-                    if (m.sessionId) console.log(m.sessionId);
-                } catch(e) {}
-            " 2>/dev/null)
-            if [[ -n "$sid" ]]; then
-                LAUNCH_SESSION_ID="$sid"
-                break
-            fi
+# ==================================================================
+# JSON parse helper (jq preferred, node fallback)
+# ==================================================================
+__cm_json_get() {
+    # Usage: __cm_json_get <json-string> <field>
+    # Returns field value on stdout, empty on failure. Supports top-level only.
+    local json="$1" field="$2" jq
+    if jq=$(__cm_resolve_jq); then
+        printf '%s' "$json" | "$jq" -r ".${field} // empty" 2>/dev/null
+    else
+        local node
+        if node=$(__cm_resolve_node); then
+            printf '%s' "$json" | "$node" -e "
+let s=''; process.stdin.on('data',d=>s+=d);
+process.stdin.on('end',()=>{try{const o=JSON.parse(s);const v=o['$field'];if(v!==undefined&&v!==null)process.stdout.write(String(v));}catch(e){}});
+" 2>/dev/null
         fi
-        sleep 0.25
-    done
-
-    # Block until claude exits
-    wait "$LAUNCH_PID"
-    LAUNCH_EXIT_CODE=$?
-
-    # Layer 2: snapshot diff
-    local new_guid="" after_guids="" delta=()
-    if [[ -d "$proj_dir_claude" ]]; then
-        for f in "$proj_dir_claude"/*.jsonl; do
-            [[ -f "$f" ]] || continue
-            g=$(basename "$f" .jsonl)
-            [[ "$g" =~ $uuid_re ]] && after_guids+="$g "
-        done
-        for g in $after_guids; do
-            if [[ " $before_guids " != *" $g "* ]]; then
-                delta+=("$g")
-            fi
-        done
-        if [[ ${#delta[@]} -eq 1 ]]; then
-            new_guid="${delta[0]}"
-        elif [[ ${#delta[@]} -gt 1 ]]; then
-            # Pick most recently modified
-            local newest=""; local newest_mt=0
-            for g in "${delta[@]}"; do
-                local mt
-                mt=$(stat -c%Y "$proj_dir_claude/$g.jsonl" 2>/dev/null || stat -f%m "$proj_dir_claude/$g.jsonl" 2>/dev/null)
-                if (( mt > newest_mt )); then newest_mt=$mt; newest=$g; fi
-            done
-            new_guid=$newest
-        fi
-    fi
-
-    # Cross-check
-    if [[ -n "$LAUNCH_SESSION_ID" && -n "$new_guid" ]]; then
-        if [[ "$LAUNCH_SESSION_ID" != "$new_guid" ]]; then
-            echo ""
-            printf "${C_YELLOW}  [warning] Session manifest says %s${C_RESET}\n" "$LAUNCH_SESSION_ID"
-            printf "${C_YELLOW}  [warning] Project file delta says %s${C_RESET}\n" "$new_guid"
-            printf "${C_YELLOW}  [warning] Using manifest. CMV or Claude wrote files cross-project.${C_RESET}\n"
-        fi
-    elif [[ -z "$LAUNCH_SESSION_ID" && -n "$new_guid" ]]; then
-        LAUNCH_SESSION_ID="$new_guid"
     fi
 }
 
-# --- Section 11.7.1: Build-RecoveryMetaPrompt ---
-build_recovery_meta_prompt() {
-    # Args: dir desc tokens last_date guid
-    local dir="$1" desc="$2" tokens="$3" last_date="$4" guid="$5"
+# ==================================================================
+# Bootstrap: cleanupPeriodDays protection
+# ==================================================================
+__cm_ensure_cleanup_period_days() {
+    local settings="$HOME/.claude/settings.json"
+    [[ -f "$settings" ]] || return 0
+    local node; node=$(__cm_resolve_node) || return 0
+    local current
+    current=$("$node" -e "try{const s=JSON.parse(require('fs').readFileSync('$settings','utf8'));process.stdout.write(String(s.cleanupPeriodDays||''))}catch(e){}" 2>/dev/null)
+    if [[ -z "$current" ]] || (( current < 1000 )); then
+        local ts; ts=$(date +%Y%m%d-%H%M%S)
+        mkdir -p "$__cm_backup_dir" 2>/dev/null
+        cp -f "$settings" "$__cm_backup_dir/settings.json.$ts" 2>/dev/null
+        "$node" -e "
+try{const fs=require('fs');const s=JSON.parse(fs.readFileSync('$settings','utf8'));s.cleanupPeriodDays=100000;fs.writeFileSync('$settings',JSON.stringify(s,null,2));}catch(e){}
+" 2>/dev/null
+        __cm_say_c "$__CM_C_CYAN" "Protected session transcripts from Claude Code's 30-day auto-delete."
+    fi
+}
+
+# ==================================================================
+# Lock, atomic write, sessions.txt I/O
+# ==================================================================
+__cm_acquire_lock() {
+    # Opens fd 9 on the lock file with exclusive lock. Retries up to 10s.
+    # On timeout, warns and proceeds unlocked (fd 9 left closed).
+    exec 9>>"$__cm_lock_file" 2>/dev/null || return 1
+    local i
+    for (( i=0; i<50; i++ )); do
+        if flock -n 9; then return 0; fi
+        sleep 0.2
+    done
+    __cm_say_c "$__CM_C_YELLOW" "[warning] Could not acquire sessions.txt lock after 10s; proceeding without lock."
+    exec 9>&- 2>/dev/null
+    return 1
+}
+
+__cm_release_lock() { exec 9>&- 2>/dev/null || true; }
+
+__cm_write_atomic() {
+    # Stdin → sessions.txt.tmp → mv onto sessions.txt.
+    cat > "$__cm_tmp_file" && mv -f "$__cm_tmp_file" "$__cm_sessions_file"
+}
+
+__cm_get_sessions() {
+    # Prints main-section lines (before [archived]) to stdout.
+    [[ -f "$__cm_sessions_file" ]] || return 0
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "${line// }" ]] && continue
+        [[ "$(printf '%s' "$line" | tr -d '[:space:]')" == "[archived]" ]] && break
+        printf '%s\n' "$line"
+    done < "$__cm_sessions_file"
+}
+
+__cm_get_archived() {
+    [[ -f "$__cm_sessions_file" ]] || return 0
+    local line in_arch=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "${line// }" ]] && continue
+        if [[ "$(printf '%s' "$line" | tr -d '[:space:]')" == "[archived]" ]]; then in_arch=1; continue; fi
+        (( in_arch )) && printf '%s\n' "$line"
+    done < "$__cm_sessions_file"
+}
+
+__cm_parse_line() {
+    # Sets globals: __cm_g, __cm_d, __cm_desc, __cm_t. Ignores trailing fields past 4.
+    local line="$1"
+    IFS='|' read -r __cm_g __cm_d __cm_desc __cm_t <<< "$line"
+    __cm_t="${__cm_t:-}"
+}
+
+__cm_save_sessions() {
+    # Args: list of pipe-joined lines (one per arg).
+    local have_lock=0
+    __cm_acquire_lock && have_lock=1
+    {
+        local s
+        for s in "$@"; do printf '%s\n' "$s"; done
+        local archived=()
+        mapfile -t archived < <(__cm_get_archived)
+        if (( ${#archived[@]} > 0 )); then
+            printf '[archived]\n'
+            for s in "${archived[@]}"; do printf '%s\n' "$s"; done
+        fi
+    } | __cm_write_atomic
+    (( have_lock )) && __cm_release_lock
+}
+
+__cm_save_archived() {
+    # Args: pipe-joined archived lines.
+    local have_lock=0
+    __cm_acquire_lock && have_lock=1
+    {
+        local main=()
+        mapfile -t main < <(__cm_get_sessions)
+        local s
+        for s in "${main[@]}"; do printf '%s\n' "$s"; done
+        if (( $# > 0 )); then
+            printf '[archived]\n'
+            for s in "$@"; do printf '%s\n' "$s"; done
+        fi
+    } | __cm_write_atomic
+    (( have_lock )) && __cm_release_lock
+}
+
+# Auto-backup sessions.txt, keep 20 most recent.
+__cm_auto_backup_sessions() {
+    [[ -s "$__cm_sessions_file" ]] || return 0
+    mkdir -p "$__cm_backup_dir" 2>/dev/null
+    local ts; ts=$(date +%Y%m%d-%H%M%S)
+    cp -f "$__cm_sessions_file" "$__cm_backup_dir/sessions.txt.$ts" 2>/dev/null
+    # Prune beyond 20
+    ls -1t "$__cm_backup_dir"/sessions.txt.* 2>/dev/null | tail -n +21 | while IFS= read -r f; do
+        rm -f -- "$f" 2>/dev/null
+    done
+}
+
+# ==================================================================
+# Get-ProjectKey, format helpers, Get-SessionInfo
+# ==================================================================
+__cm_get_proj_key() {
+    # Replace every non-alphanumeric char with dash. Canonical encoding.
+    printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'
+}
+
+__cm_format_tokens() {
+    # Input: integer or empty. Output: "-- " / "1.2M tok" / "155K tok" / "<n> tok".
+    local t="$1"
+    [[ -z "$t" ]] && { printf '%s' "--"; return; }
+    if (( t >= 1000000 )); then
+        awk -v v="$t" 'BEGIN{printf "%.1fM tok", v/1000000}'
+    elif (( t >= 1000 )); then
+        awk -v v="$t" 'BEGIN{printf "%dK tok", int(v/1000 + 0.5)}'
+    else
+        printf '%s tok' "$t"
+    fi
+}
+
+__cm_format_size() {
+    local b="$1"
+    if (( b >= 1048576 )); then
+        awk -v v="$b" 'BEGIN{printf "%.1f MB", v/1048576}'
+    elif (( b >= 1024 )); then
+        awk -v v="$b" 'BEGIN{printf "%d KB", int(v/1024 + 0.5)}'
+    else
+        printf '%d B' "$b"
+    fi
+}
+
+__cm_format_date_short() {
+    # Input: epoch seconds. If year < current year, "Mon D, YYYY" else "Mon D".
+    local epoch="$1"
+    local now_year; now_year=$(date +%Y)
+    local file_year; file_year=$(date -d "@$epoch" +%Y 2>/dev/null || date -r "$epoch" +%Y 2>/dev/null)
+    if [[ -n "$file_year" && "$file_year" -lt "$now_year" ]]; then
+        date -d "@$epoch" "+%b %-d, %Y" 2>/dev/null || date -r "$epoch" "+%b %-d, %Y" 2>/dev/null
+    else
+        date -d "@$epoch" "+%b %-d" 2>/dev/null || date -r "$epoch" "+%b %-d" 2>/dev/null
+    fi
+}
+
+__cm_file_mtime_epoch() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+__cm_file_ctime_epoch() { stat -c %W "$1" 2>/dev/null || stat -f %B "$1" 2>/dev/null; }
+__cm_file_size()        { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null; }
+
+# Sets globals: __cm_info_size, __cm_info_date, __cm_info_tokens, __cm_info_status
+__cm_get_session_info() {
+    local guid="$1" dir="$2" tokens="$3"
+    local proj_key proj_dir jsonl
+    proj_key=$(__cm_get_proj_key "$dir")
+    proj_dir="$HOME/.claude/projects/$proj_key"
+    jsonl="$proj_dir/$guid.jsonl"
+    __cm_info_tokens=$(__cm_format_tokens "$tokens")
+    if [[ -f "$jsonl" ]]; then
+        __cm_info_size=$(__cm_format_size "$(__cm_file_size "$jsonl")")
+        __cm_info_date=$(__cm_format_date_short "$(__cm_file_mtime_epoch "$jsonl")")
+        __cm_info_status=ok
+        return
+    fi
+    # Missing; walk fallback chain for date.
+    local fb=""
+    if [[ -d "$proj_dir/$guid" ]]; then
+        fb=$(__cm_file_mtime_epoch "$proj_dir/$guid")
+    elif [[ -d "$proj_dir/memory" ]]; then
+        fb=$(__cm_file_mtime_epoch "$proj_dir/memory")
+    elif [[ -f "$proj_dir/sessions-index.json" ]]; then
+        local node; node=$(__cm_resolve_node) && fb=$("$node" -e "
+try{const fs=require('fs');const d=JSON.parse(fs.readFileSync('$proj_dir/sessions-index.json','utf8'));
+const e=(d.entries||[]).find(x=>x.sessionId==='$guid');
+if(e&&e.created)process.stdout.write(String(Math.floor(new Date(e.created).getTime()/1000)));}catch(e){}
+" 2>/dev/null)
+    fi
+    if [[ -n "$fb" ]]; then
+        __cm_info_date=$(__cm_format_date_short "$fb")"*"
+    else
+        __cm_info_date="--"
+    fi
+    __cm_info_size="(missing)"
+    __cm_info_status=missing
+}
+
+# ==================================================================
+# Sync-SessionIndex (best-effort, always silent on failure)
+# ==================================================================
+__cm_sync_session_index() {
+    local project_dir="$1"
+    local node; node=$(__cm_resolve_node) || return 0
+    local proj_key proj_dir
+    proj_key=$(__cm_get_proj_key "$project_dir")
+    proj_dir="$HOME/.claude/projects/$proj_key"
+    [[ -d "$proj_dir" ]] || return 0
+    # Build a text listing of "guid|desc|dir" for sessions-registered entries.
+    local reg_file; reg_file=$(mktemp) || return 0
+    {
+        __cm_get_sessions
+        __cm_get_archived
+    } > "$reg_file"
+    "$node" - "$proj_dir" "$project_dir" "$reg_file" <<'NODEJS' 2>/dev/null
+const fs = require('fs'), path = require('path');
+const [,, projDir, originalPathArg, regFile] = process.argv;
+try {
+  const files = fs.readdirSync(projDir).filter(n => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/.test(n));
+  if (files.length === 0) return;
+  const indexPath = path.join(projDir, 'sessions-index.json');
+  let existing = [], originalPath = originalPathArg;
+  if (fs.existsSync(indexPath)) {
+    try { const j = JSON.parse(fs.readFileSync(indexPath,'utf8')); existing = j.entries || []; if (j.originalPath) originalPath = j.originalPath; } catch(e) { existing = []; }
+  }
+  const onDisk = {};
+  for (const n of files) {
+    const full = path.join(projDir, n);
+    const st = fs.statSync(full);
+    onDisk[n.replace(/\.jsonl$/, '')] = { full, mtime: st.mtimeMs, ctime: st.ctimeMs };
+  }
+  const kept = [];
+  for (const e of existing) {
+    if (e && e.sessionId && onDisk[e.sessionId]) {
+      const d = onDisk[e.sessionId];
+      e.fileMtime = Math.floor(d.mtime);
+      e.modified = new Date(d.mtime).toISOString();
+      kept.push(e);
+    }
+  }
+  const keptSet = new Set(kept.map(x => x.sessionId));
+  // Build registered-desc map from reg_file
+  const reg = {};
+  try {
+    for (const line of fs.readFileSync(regFile,'utf8').split('\n')) {
+      if (!line || line.trim() === '[archived]') continue;
+      const parts = line.split('|');
+      if (parts[0]) reg[parts[0]] = { desc: parts[2] || '', dir: parts[1] || '' };
+    }
+  } catch(e) {}
+  const added = [];
+  for (const guid of Object.keys(onDisk)) {
+    if (keptSet.has(guid)) continue;
+    const d = onDisk[guid];
+    const r = reg[guid] || {};
+    added.push({
+      sessionId: guid,
+      fullPath: d.full,
+      fileMtime: Math.floor(d.mtime),
+      firstPrompt: r.desc || '',
+      messageCount: 0,
+      created: new Date(d.ctime || d.mtime).toISOString(),
+      modified: new Date(d.mtime).toISOString(),
+      gitBranch: '',
+      projectPath: r.dir || originalPath,
+      isSidechain: false
+    });
+  }
+  const out = { version: 1, entries: kept.concat(added), originalPath };
+  fs.writeFileSync(indexPath, JSON.stringify(out, null, 2));
+} catch(e) {}
+NODEJS
+    rm -f "$reg_file" 2>/dev/null
+    return 0
+}
+
+# ==================================================================
+# Do-DeleteSession (destructive)
+# ==================================================================
+__cm_do_delete_session() {
+    local guid="$1" dir="$2"
+    local proj_key proj_dir
+    proj_key=$(__cm_get_proj_key "$dir")
+    proj_dir="$HOME/.claude/projects/$proj_key"
+    [[ -f "$proj_dir/$guid.jsonl" ]] && rm -f "$proj_dir/$guid.jsonl"
+    [[ -d "$proj_dir/$guid" ]] && rm -rf "$proj_dir/$guid"
+    __cm_sync_session_index "$dir"
+}
+
+# ==================================================================
+# Do-OrphanScan
+# ==================================================================
+# Sets __cm_scan_result_action (empty, or "select") and __cm_scan_result_guid.
+__cm_do_orphan_scan() {
+    local scan_dir="$1" registered_guid="$2"
+    __cm_scan_result_action=""; __cm_scan_result_guid=""
+    local proj_key proj_dir
+    proj_key=$(__cm_get_proj_key "$scan_dir")
+    proj_dir="$HOME/.claude/projects/$proj_key"
+    [[ -d "$proj_dir" ]] || return 0
+    # Collect *.jsonl sorted by mtime descending.
+    local files=() f
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(
+        ls -1t "$proj_dir"/*.jsonl 2>/dev/null
+    )
+    (( ${#files[@]} <= 1 )) && return 0
+    # Combined registered set: main + archived.
+    local sessions=() line
+    while IFS= read -r line; do sessions+=("$line"); done < <(__cm_get_sessions)
+    while IFS= read -r line; do sessions+=("$line"); done < <(__cm_get_archived)
+    # Detect problems.
+    local has_problem=0
+    for f in "${files[@]}"; do
+        local g; g=$(basename "$f" .jsonl)
+        local match_dir=""
+        for s in "${sessions[@]}"; do
+            local sg sd
+            IFS='|' read -r sg sd _ _ <<< "$s"
+            if [[ "$sg" == "$g" ]]; then match_dir="$sd"; break; fi
+        done
+        if [[ -z "$match_dir" ]]; then has_problem=1; break; fi
+        if [[ "$match_dir" != "$scan_dir" ]]; then has_problem=1; break; fi
+    done
+    (( has_problem )) || return 0
+    __cm_blank
+    __cm_say_c "$__CM_C_YELLOW" "Multiple conversation files found (${#files[@]}):"
+    __cm_blank
+    __cm_say "#   Last Modified          Size     Session Name"
+    __cm_say "--- --------------------  --------  ---------------------------"
+    local i=0
+    for f in "${files[@]}"; do
+        i=$((i+1))
+        local g; g=$(basename "$f" .jsonl)
+        local sz; sz=$(__cm_format_size "$(__cm_file_size "$f")")
+        local dt; dt=$(date -d "@$(__cm_file_mtime_epoch "$f")" "+%Y-%m-%d %H:%M" 2>/dev/null \
+                      || date -r "$(__cm_file_mtime_epoch "$f")" "+%Y-%m-%d %H:%M" 2>/dev/null)
+        local name="(orphan)" marker="" sd=""
+        for s in "${sessions[@]}"; do
+            local sg sd2 sdesc
+            IFS='|' read -r sg sd2 sdesc _ <<< "$s"
+            if [[ "$sg" == "$g" ]]; then name="$sdesc"; sd="$sd2"; break; fi
+        done
+        [[ -n "$sd" && "$sd" != "$scan_dir" ]] && name="$name (wrong directory)"
+        [[ "$g" == "$registered_guid" ]] && marker=" *"
+        printf '  %-3d %s  %8s  %s%s\n' "$i" "$dt" "$sz" "$name" "$marker"
+    done
+    __cm_blank
+    __cm_say "* = registered session for this directory"
+    __cm_blank
+    __cm_say "Actions: [number] to select, [q number] to quarantine to backup, [Enter] to continue with registered session"
+    local cmd; read -rp "  >: " cmd
+    if [[ "$cmd" =~ ^[0-9]+$ ]]; then
+        local idx=$((cmd - 1))
+        if (( idx >= 0 && idx < ${#files[@]} )); then
+            __cm_scan_result_action="select"
+            __cm_scan_result_guid=$(basename "${files[idx]}" .jsonl)
+        else __cm_say "Invalid number."
+        fi
+    elif [[ "$cmd" =~ ^[qQ][[:space:]]*([0-9]+)$ ]]; then
+        local idx=$((${BASH_REMATCH[1]} - 1))
+        if (( idx >= 0 && idx < ${#files[@]} )); then
+            local f="${files[idx]}" g
+            g=$(basename "$f" .jsonl)
+            if [[ "$g" == "$registered_guid" ]]; then
+                __cm_say_c "$__CM_C_RED" "Cannot quarantine the registered session."
+            else
+                local leaf dest
+                leaf=$(basename "$scan_dir")
+                dest="$__cm_quarantine_root/$leaf"
+                mkdir -p "$dest" 2>/dev/null
+                mv -f "$f" "$dest/$(basename "$f")" 2>/dev/null
+                [[ -d "$proj_dir/$g" ]] && mv -f "$proj_dir/$g" "$dest/$g" 2>/dev/null
+                __cm_sync_session_index "$scan_dir"
+                __cm_say_c "$__CM_C_GREEN" "Quarantined to backup: $leaf/$g"
+            fi
+        else __cm_say "Invalid number."
+        fi
+    fi
+}
+
+# ==================================================================
+# Show-List
+# ==================================================================
+__cm_show_list() {
+    local highlight="${1:-0}"
+    __cm_blank
+    __cm_say "=== Saved Sessions ==="
+    __cm_blank
+    local sessions=() s
+    mapfile -t sessions < <(__cm_get_sessions)
+    local count=${#sessions[@]}
+    (( count == 0 )) && return
+    local max_desc=10 num_width=${#count} i=0
+    for s in "${sessions[@]}"; do
+        local _g _d _desc _t
+        IFS='|' read -r _g _d _desc _t <<< "$s"
+        (( ${#_desc} > max_desc )) && max_desc=${#_desc}
+    done
+    for s in "${sessions[@]}"; do
+        i=$((i+1))
+        local g d desc t
+        IFS='|' read -r g d desc t <<< "$s"
+        __cm_get_session_info "$g" "$d" "$t"
+        local num="$i."
+        local num_pad; num_pad=$(printf '%-*s' $((num_width + 2)) "$num")
+        local desc_pad; desc_pad=$(printf '%-*s' $((max_desc + 2)) "$desc")
+        local size_pad; size_pad=$(printf '%9s' "$__cm_info_size")
+        local tok_pad;  tok_pad=$(printf '%10s' "$__cm_info_tokens")
+        local line="  $num_pad $desc_pad $size_pad  $tok_pad   $__cm_info_date"$'\t'"$d"
+        if [[ "$highlight" == "$i" ]]; then
+            printf '  %b*** %s %s %s  %s   %s\t%s  [Selected] ***%b\n' \
+                "$__CM_C_YELLOW" "$num_pad" "$desc_pad" "$size_pad" "$tok_pad" "$__cm_info_date" "$d" "$__CM_C_RESET"
+        else
+            printf '%s\n' "$line"
+        fi
+    done
+    __cm_blank
+    local arch_count; arch_count=$(__cm_get_archived | wc -l | tr -d ' ')
+    __cm_say "E. Edit this list"
+    (( arch_count > 0 )) && __cm_say "V. View archived ($arch_count)"
+    __cm_say "M. Machine name ($__cm_machine_name)"
+}
+
+# ==================================================================
+# Do-ViewArchived
+# ==================================================================
+__cm_do_view_archived() {
+    while true; do
+        local archived=()
+        mapfile -t archived < <(__cm_get_archived)
+        if (( ${#archived[@]} == 0 )); then
+            __cm_blank; __cm_say "No archived sessions."; return
+        fi
+        __cm_blank
+        __cm_say "=== Archived Sessions ==="
+        __cm_blank
+        local i=0 s
+        for s in "${archived[@]}"; do
+            i=$((i+1))
+            local g d desc t
+            IFS='|' read -r g d desc t <<< "$s"
+            __cm_get_session_info "$g" "$d" "$t"
+            __cm_say "$i. $desc  [$d]  $__cm_info_size"
+        done
+        __cm_blank
+        __cm_say "U# = Unarchive   D# = Delete permanently   Q = Back"
+        __cm_blank
+        local cmd; read -rp "  >: " cmd
+        if [[ -z "$cmd" || "$cmd" == "q" || "$cmd" == "Q" ]]; then return; fi
+        if [[ "$cmd" =~ ^[uU]([0-9]+)$ ]]; then
+            local idx=$((${BASH_REMATCH[1]} - 1))
+            if (( idx >= 0 && idx < ${#archived[@]} )); then
+                local entry="${archived[idx]}"
+                local new_arch=()
+                local j
+                for (( j=0; j<${#archived[@]}; j++ )); do (( j != idx )) && new_arch+=("${archived[j]}"); done
+                __cm_save_archived "${new_arch[@]}"
+                local main=()
+                mapfile -t main < <(__cm_get_sessions)
+                __cm_save_sessions "$entry" "${main[@]}"
+                local _g _d desc _t; IFS='|' read -r _g _d desc _t <<< "$entry"
+                __cm_say_c "$__CM_C_GREEN" "Unarchived: $desc"
+            else __cm_say "Invalid number."
+            fi
+        elif [[ "$cmd" =~ ^[dD]([0-9]+)$ ]]; then
+            local idx=$((${BASH_REMATCH[1]} - 1))
+            if (( idx >= 0 && idx < ${#archived[@]} )); then
+                __cm_say_c "$__CM_C_RED" "This permanently deletes the conversation file and all associated data."
+                __cm_say_c "$__CM_C_RED" "This cannot be undone."
+                local confirm; read -rp "  Type 'delete' to confirm: " confirm
+                if [[ "${confirm,,}" == "delete" ]]; then
+                    local entry="${archived[idx]}"
+                    local g d desc t; IFS='|' read -r g d desc t <<< "$entry"
+                    __cm_do_delete_session "$g" "$d"
+                    local new_arch=()
+                    local j
+                    for (( j=0; j<${#archived[@]}; j++ )); do (( j != idx )) && new_arch+=("${archived[j]}"); done
+                    __cm_save_archived "${new_arch[@]}"
+                    __cm_say_c "$__CM_C_GREEN" "Deleted: $desc"
+                else __cm_say "Cancelled."
+                fi
+            else __cm_say "Invalid number."
+            fi
+        else __cm_say "Unknown command."
+        fi
+    done
+}
+
+# ==================================================================
+# Do-EditList
+# ==================================================================
+__cm_do_edit_list() {
+    while true; do
+        local sessions=()
+        mapfile -t sessions < <(__cm_get_sessions)
+        __cm_blank
+        __cm_say "=== Edit Sessions ==="
+        __cm_blank
+        local i=0 s
+        for s in "${sessions[@]}"; do
+            i=$((i+1))
+            local g d desc t; IFS='|' read -r g d desc t <<< "$s"
+            __cm_say "$i. $desc  [$d]"
+        done
+        __cm_blank
+        __cm_say "R# = Rename   P# = Path   A# = Archive   D# = Delete   M#,# = Move   Q = Done"
+        __cm_blank
+        local cmd; read -rp "  >: " cmd
+        [[ -z "$cmd" || "$cmd" == "q" || "$cmd" == "Q" ]] && return
+        local count=${#sessions[@]}
+        if [[ "$cmd" =~ ^[rR]([0-9]+)$ ]]; then
+            local idx=$((${BASH_REMATCH[1]} - 1))
+            if (( idx >= 0 && idx < count )); then
+                local g d desc t; IFS='|' read -r g d desc t <<< "${sessions[idx]}"
+                local new_name; read -rp "  New name for '$desc': " new_name
+                if [[ -n "$new_name" ]]; then
+                    sessions[idx]="$g|$d|$new_name|$t"
+                    __cm_save_sessions "${sessions[@]}"
+                fi
+            else __cm_say "Invalid number."
+            fi
+        elif [[ "$cmd" =~ ^[pP]([0-9]+)$ ]]; then
+            local idx=$((${BASH_REMATCH[1]} - 1))
+            if (( idx >= 0 && idx < count )); then
+                local g d desc t; IFS='|' read -r g d desc t <<< "${sessions[idx]}"
+                __cm_say "Current: $d"
+                local new_path; read -rp "  New path (Enter to keep): " new_path
+                if [[ -n "$new_path" ]]; then
+                    if [[ ! -d "$new_path" ]]; then __cm_say "Path does not exist: $new_path"; continue; fi
+                    local old_key new_key old_proj new_proj
+                    old_key=$(__cm_get_proj_key "$d")
+                    new_key=$(__cm_get_proj_key "$new_path")
+                    old_proj="$HOME/.claude/projects/$old_key"
+                    new_proj="$HOME/.claude/projects/$new_key"
+                    if [[ -f "$old_proj/$g.jsonl" ]]; then
+                        mkdir -p "$new_proj" 2>/dev/null
+                        cp -f "$old_proj/$g.jsonl" "$new_proj/$g.jsonl"
+                        __cm_say "Session file copied to new project directory."
+                    else
+                        __cm_say "Warning: Session file not found at old path. Resume may not work."
+                    fi
+                    sessions[idx]="$g|$new_path|$desc|$t"
+                    __cm_save_sessions "${sessions[@]}"
+                    __cm_sync_session_index "$new_path"
+                    __cm_sync_session_index "$d"
+                fi
+            else __cm_say "Invalid number."
+            fi
+        elif [[ "$cmd" =~ ^[aA]([0-9]+)$ ]]; then
+            local idx=$((${BASH_REMATCH[1]} - 1))
+            if (( idx >= 0 && idx < count )); then
+                local entry="${sessions[idx]}"
+                local g d desc t; IFS='|' read -r g d desc t <<< "$entry"
+                local new_s=() j
+                for (( j=0; j<count; j++ )); do (( j != idx )) && new_s+=("${sessions[j]}"); done
+                __cm_save_sessions "${new_s[@]}"
+                local archived=()
+                mapfile -t archived < <(__cm_get_archived)
+                archived+=("$entry")
+                __cm_save_archived "${archived[@]}"
+                __cm_say_c "$__CM_C_GREEN" "Archived: $desc"
+            else __cm_say "Invalid number."
+            fi
+        elif [[ "$cmd" =~ ^[dD]([0-9]+)$ ]]; then
+            local idx=$((${BASH_REMATCH[1]} - 1))
+            if (( idx >= 0 && idx < count )); then
+                __cm_say_c "$__CM_C_RED" "This permanently deletes the conversation file and all associated data."
+                __cm_say_c "$__CM_C_RED" "This cannot be undone."
+                local confirm; read -rp "  Type 'delete' to confirm: " confirm
+                if [[ "${confirm,,}" == "delete" ]]; then
+                    local entry="${sessions[idx]}"
+                    local g d desc t; IFS='|' read -r g d desc t <<< "$entry"
+                    __cm_do_delete_session "$g" "$d"
+                    local new_s=() j
+                    for (( j=0; j<count; j++ )); do (( j != idx )) && new_s+=("${sessions[j]}"); done
+                    __cm_save_sessions "${new_s[@]}"
+                    __cm_say_c "$__CM_C_GREEN" "Deleted: $desc"
+                else __cm_say "Cancelled."
+                fi
+            else __cm_say "Invalid number."
+            fi
+        elif [[ "$cmd" =~ ^[mM]([0-9]+),([0-9]+)$ ]]; then
+            local from=$((${BASH_REMATCH[1]} - 1)) to=$((${BASH_REMATCH[2]} - 1))
+            if (( from >= 0 && from < count && to >= 0 && to < count )); then
+                local item="${sessions[from]}"
+                local new_s=() j
+                for (( j=0; j<count; j++ )); do (( j != from )) && new_s+=("${sessions[j]}"); done
+                local result=() k=0
+                for (( j=0; j<=${#new_s[@]}; j++ )); do
+                    if (( j == to )); then result+=("$item"); fi
+                    if (( j < ${#new_s[@]} )); then result+=("${new_s[j]}"); fi
+                done
+                __cm_save_sessions "${result[@]}"
+            else __cm_say "Invalid numbers."
+            fi
+        else __cm_say "Unknown command."
+        fi
+    done
+}
+
+# ==================================================================
+# Build-RecoveryMetaPrompt — verbatim template from spec 11.7.1
+# ==================================================================
+__cm_build_recovery_meta_prompt() {
+    local guid="$1" dir="$2" desc="$3" tokens="$4" last_date="$5"
     local proj_key proj_dir memory_dir subagents_dir
-    proj_key=$(get_proj_key "$dir")
+    proj_key=$(__cm_get_proj_key "$dir")
     proj_dir="$HOME/.claude/projects/$proj_key"
     memory_dir="$proj_dir/memory"
     subagents_dir="$proj_dir/$guid/subagents"
-
-    local memory_list=""
+    local memory_list="  (none)"
     if [[ -d "$memory_dir" ]]; then
+        local lines=() f
         while IFS= read -r f; do
-            local sz mt
-            sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
-            local kb=$((sz / 1024))
-            mt=$(date -r "$f" "+%Y-%m-%d" 2>/dev/null || date -d "@$(stat -c%Y "$f")" "+%Y-%m-%d" 2>/dev/null)
-            memory_list+="  * $(basename "$f") (${kb} KB, modified ${mt})"$'\n'
-        done < <(find "$memory_dir" -name "*.md" 2>/dev/null)
-    fi
-    [[ -z "$memory_list" ]] && memory_list="  (none)"
-
-    local agent_count=0
-    [[ -d "$subagents_dir" ]] && agent_count=$(find "$subagents_dir" -name "*.jsonl" 2>/dev/null | wc -l)
-
-    local subagent_latest="unknown"
-    if [[ -d "$subagents_dir" ]]; then
-        local latest
-        latest=$(find "$subagents_dir" -name "*.jsonl" -printf "%T@ %p\n" 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)
-        if [[ -n "$latest" ]]; then
-            subagent_latest=$(date -r "$latest" "+%Y-%m-%d" 2>/dev/null || date -d "@$(stat -c%Y "$latest")" "+%Y-%m-%d" 2>/dev/null)
+            local sz_kb mod
+            sz_kb=$(( ($(__cm_file_size "$f") + 512) / 1024 ))
+            mod=$(date -d "@$(__cm_file_mtime_epoch "$f")" "+%Y-%m-%d" 2>/dev/null \
+                 || date -r "$(__cm_file_mtime_epoch "$f")" "+%Y-%m-%d" 2>/dev/null)
+            lines+=("  * $(basename "$f") ($sz_kb KB, modified $mod)")
+        done < <(ls -1 "$memory_dir"/*.md 2>/dev/null)
+        if (( ${#lines[@]} > 0 )); then
+            memory_list=$(printf '%s\n' "${lines[@]}")
         fi
     fi
-
-    local tok_str="${tokens:+${tokens} tokens}"
-    [[ -z "$tok_str" ]] && tok_str="unknown token count"
+    local subagent_count=0 subagent_latest="unknown"
+    if [[ -d "$subagents_dir" ]]; then
+        local agents=() a
+        while IFS= read -r a; do agents+=("$a"); done < <(ls -1t "$subagents_dir"/*.jsonl 2>/dev/null)
+        subagent_count=${#agents[@]}
+        if (( subagent_count > 0 )); then
+            subagent_latest=$(date -d "@$(__cm_file_mtime_epoch "${agents[0]}")" "+%Y-%m-%d" 2>/dev/null \
+                             || date -r "$(__cm_file_mtime_epoch "${agents[0]}")" "+%Y-%m-%d" 2>/dev/null)
+        fi
+    fi
+    local tok_str="unknown token count"
+    [[ -n "$tokens" ]] && tok_str="$tokens tokens"
     local date_str="${last_date:-unknown}"
-
     cat <<EOF
 Context: a Claude Code session was deleted. You need to produce orientation text for a future Claude Code session that will read this text as its first input. Produce the text. That text goes directly into the next session. It is NOT a summary, NOT a description, NOT a report about what you did. It is the directives themselves.
 
 Read these artifacts:
 * Memory files in ${memory_dir}
-* Subagent transcripts in ${subagents_dir} (2-3 most recent; total on disk: $agent_count, latest dated $subagent_latest)
-* The project code at $dir
+* Subagent transcripts in ${subagents_dir} (2-3 most recent; total on disk: ${subagent_count}, latest dated ${subagent_latest})
+* The project code at ${dir}
 
 Session metadata (for reference when you write):
-* Session name: $desc
-* Project path: $dir
-* Last activity: $date_str
-* Conversation size when lost: $tok_str
+* Session name: ${desc}
+* Project path: ${dir}
+* Last activity: ${date_str}
+* Conversation size when lost: ${tok_str}
 
 Now replace every <PLACEHOLDER> below and OUTPUT the completed template. Start your output with "This is a recovery session." and end with "ask before assuming." Output nothing else. No preamble, no confirmation, no summary of what you did.
 
-This is a recovery session. The previous conversation transcript for "$desc" was deleted. The project lives at $dir. Memory, subagent state, and source code all survived.
+This is a recovery session. The previous conversation transcript for "${desc}" was deleted. The project lives at ${dir}. Memory, subagent state, and source code all survived.
 
 Read these files in this order:
 
@@ -671,330 +746,275 @@ Read these in order. Do not run builds, tests, or git commands yet. Do not modif
 EOF
 }
 
-# --- Section 11.7: Resolve-ResumeOrRecover ---
-RECOVER_ACTION=""
-RECOVER_GUID=""
-resolve_resume_or_recover() {
-    RECOVER_ACTION=""
-    RECOVER_GUID=""
+# ==================================================================
+# Resolve-ResumeOrRecover (recovery primer flow)
+# ==================================================================
+# Sets __cm_recover_action ("normal"|"fresh"|"primed"|"cancel") and __cm_recover_guid.
+__cm_resolve_resume_or_recover() {
     local guid="$1" dir="$2" desc="$3" tokens="$4"
-    local proj_key proj_dir jsonl
-    proj_key=$(get_proj_key "$dir")
-    proj_dir="$HOME/.claude/projects/$proj_key"
-    jsonl="$proj_dir/$guid.jsonl"
-
+    __cm_recover_action=""; __cm_recover_guid=""
+    local proj_key jsonl
+    proj_key=$(__cm_get_proj_key "$dir")
+    jsonl="$HOME/.claude/projects/$proj_key/$guid.jsonl"
     if [[ -f "$jsonl" ]]; then
-        RECOVER_ACTION="normal"
-        RECOVER_GUID="$guid"
-        return
+        __cm_recover_action="normal"; __cm_recover_guid="$guid"; return
     fi
-
-    echo ""
-    printf "${C_YELLOW}  The conversation transcript for '%s' has been lost.${C_RESET}\n" "$desc"
-    echo "  Probably due to Claude Code's 30-day auto-cleanup."
-    echo "  Memory files and subagent state are intact."
-    echo ""
-    echo "  You have three options:"
-    echo "    1. Start a fresh Claude session in that directory"
-    echo "    2. Create a recovery-prompt.md file in the project directory, that you can prompt Claude to read and execute, with optional edits."
-    echo "    3. Cancel"
-    echo ""
-    read -rp "  > " choice
-
+    __cm_blank
+    __cm_say_c "$__CM_C_YELLOW" "The conversation transcript for '$desc' has been lost."
+    __cm_say "Probably due to Claude Code's 30-day auto-cleanup."
+    __cm_say "Memory files and subagent state are intact."
+    __cm_blank
+    __cm_say "You have three options:"
+    __cm_say "  1. Start a fresh Claude session in that directory"
+    __cm_say "  2. Create a recovery-prompt.md file in the project directory, that you can prompt Claude to read and execute, with optional edits."
+    __cm_say "  3. Cancel"
+    __cm_blank
+    local choice; read -rp "  > " choice
     case "$choice" in
-        1) RECOVER_ACTION="fresh"; return ;;
-        2) ;;
-        *) RECOVER_ACTION="cancel"; return ;;
+        1) __cm_recover_action="fresh"; return ;;
+        3|"") __cm_recover_action="cancel"; return ;;
+        2)
+            if [[ ! -d "$dir" ]]; then
+                __cm_say_c "$__CM_C_RED" "Project directory not found: $dir"
+                __cm_recover_action="cancel"; return
+            fi
+            # Rotate existing recovery-prompt.md files.
+            local primary="$dir/recovery-prompt.md"
+            if [[ -f "$primary" ]]; then
+                local max_n=1 f n
+                shopt -s nullglob
+                for f in "$dir"/recovery-prompt.md.old*; do
+                    local bn; bn=$(basename "$f")
+                    if [[ "$bn" =~ recovery-prompt\.md\.old([0-9]+)$ ]]; then
+                        n="${BASH_REMATCH[1]}"
+                        (( n >= max_n )) && max_n=$((n + 1))
+                    fi
+                done
+                # Rotate in descending order to avoid collisions.
+                local to_rotate=() pair
+                for f in "$dir"/recovery-prompt.md.old*; do
+                    local bn num=1
+                    bn=$(basename "$f")
+                    if [[ "$bn" =~ recovery-prompt\.md\.old([0-9]+)$ ]]; then num="${BASH_REMATCH[1]}"; fi
+                    to_rotate+=("$num|$f")
+                done
+                shopt -u nullglob
+                # Sort descending by num.
+                IFS=$'\n' to_rotate=($(printf '%s\n' "${to_rotate[@]}" | sort -t'|' -k1,1nr))
+                for pair in "${to_rotate[@]}"; do
+                    local num path; IFS='|' read -r num path <<< "$pair"
+                    mv -f "$path" "$dir/recovery-prompt.md.old$((num + 1))" 2>/dev/null
+                done
+                mv -f "$primary" "$dir/recovery-prompt.md.old" 2>/dev/null
+            fi
+            __cm_blank
+            __cm_say_c "$__CM_C_CYAN" "Generating recovery prompt (this may take a minute)..."
+            __cm_get_session_info "$guid" "$dir" "$tokens"
+            local meta_prompt; meta_prompt=$(__cm_build_recovery_meta_prompt "$guid" "$dir" "$desc" "$tokens" "$__cm_info_date")
+            local orig_dir; orig_dir=$(pwd)
+            cd "$dir" || { __cm_recover_action="cancel"; return; }
+            local tmp_file; tmp_file=$(mktemp)
+            printf '%s' "$meta_prompt" > "$tmp_file"
+            local claude_exe; claude_exe=$(__cm_resolve_claude)
+            local primer_json=""
+            if [[ -n "$claude_exe" ]]; then
+                primer_json=$("$claude_exe" -p --output-format json --dangerously-skip-permissions < "$tmp_file" 2>/dev/null)
+            fi
+            rm -f "$tmp_file"
+            local recovery_prompt primer_sid
+            recovery_prompt=$(__cm_json_get "$primer_json" "result")
+            primer_sid=$(__cm_json_get "$primer_json" "session_id")
+            # Cleanup throwaway -p session.
+            if [[ -n "$primer_sid" ]]; then
+                local pk; pk=$(__cm_get_proj_key "$(pwd)")
+                rm -f "$HOME/.claude/projects/$pk/$primer_sid.jsonl" 2>/dev/null
+                rm -rf "$HOME/.claude/projects/$pk/$primer_sid" 2>/dev/null
+                __cm_sync_session_index "$(pwd)"
+            fi
+            if [[ -z "$recovery_prompt" ]]; then
+                __cm_say_c "$__CM_C_RED" "Recovery prompt generation failed."
+                cd "$orig_dir"
+                __cm_recover_action="cancel"; return
+            fi
+            printf '%s' "$recovery_prompt" > "$primary"
+            __cm_blank
+            __cm_say_c "$__CM_C_GREEN" "Recovery prompt saved to:"
+            __cm_say "  $primary"
+            __cm_blank
+            __cm_say "Edit it if you want, or just tell Claude to use it as the first message of the conversation."
+            __cm_say_c "$__CM_C_CYAN" "Opening a fresh Claude session in that directory now..."
+            __cm_blank
+            cd "$orig_dir"
+            __cm_recover_action="fresh"; return
+            ;;
+        *) __cm_recover_action="cancel"; return ;;
     esac
-
-    if [[ ! -d "$dir" ]]; then
-        printf "${C_RED}  Project directory not found: %s${C_RESET}\n" "$dir"
-        RECOVER_ACTION="cancel"; return
-    fi
-
-    # Rotate existing recovery-prompt.md files
-    local primary="$dir/recovery-prompt.md"
-    if [[ -f "$primary" ]]; then
-        local max_n=1 f n
-        for f in "$dir"/recovery-prompt.md.old*; do
-            [[ -e "$f" ]] || continue
-            if [[ "$f" =~ \.md\.old([0-9]+)$ ]]; then
-                n=${BASH_REMATCH[1]}
-                (( n >= max_n )) && max_n=$((n + 1))
-            fi
-        done
-        local i src dst
-        for ((i = max_n; i >= 1; i--)); do
-            if (( i == 1 )); then
-                src="$dir/recovery-prompt.md.old"
-            else
-                src="$dir/recovery-prompt.md.old$i"
-            fi
-            dst="$dir/recovery-prompt.md.old$((i + 1))"
-            [[ -f "$src" ]] && mv "$src" "$dst" 2>/dev/null
-        done
-        mv "$primary" "$dir/recovery-prompt.md.old" 2>/dev/null
-    fi
-
-    echo ""
-    printf "${C_CYAN}  Generating recovery prompt (this may take a minute)...${C_RESET}\n"
-
-    # Get last_date for the meta-prompt context
-    local info last_date
-    info=$(get_session_info "$guid" "$dir" "$tokens")
-    last_date=$(echo "$info" | cut -d'|' -f2)
-
-    local meta_prompt
-    meta_prompt=$(build_recovery_meta_prompt "$dir" "$desc" "$tokens" "$last_date" "$guid")
-
-    local orig_dir
-    orig_dir=$(pwd)
-    cd "$dir" || { RECOVER_ACTION="cancel"; return; }
-
-    local primer_json
-    primer_json=$(echo "$meta_prompt" | "$CLAUDE_EXE" -p --output-format json --dangerously-skip-permissions 2>/dev/null)
-
-    local recovery_prompt="" primer_session_id=""
-    if [[ -n "$primer_json" && -n "$NODE_EXE" ]]; then
-        recovery_prompt=$("$NODE_EXE" -e "
-            try { console.log(JSON.parse(process.argv[1]).result) } catch(e) {}
-        " "$primer_json" 2>/dev/null)
-        primer_session_id=$("$NODE_EXE" -e "
-            try { console.log(JSON.parse(process.argv[1]).session_id) } catch(e) {}
-        " "$primer_json" 2>/dev/null)
-    fi
-
-    # Cleanup the throwaway -p session immediately (Section 11.7 step g)
-    if [[ -n "$primer_session_id" ]]; then
-        local primer_proj_key="$(get_proj_key "$(pwd)")"
-        local primer_proj="$HOME/.claude/projects/$primer_proj_key"
-        rm -f "$primer_proj/$primer_session_id.jsonl" 2>/dev/null
-        [[ -d "$primer_proj/$primer_session_id" ]] && rm -rf "$primer_proj/$primer_session_id" 2>/dev/null
-        sync_session_index "$(pwd)"
-    fi
-
-    cd "$orig_dir"
-
-    if [[ -z "$recovery_prompt" ]]; then
-        printf "${C_RED}  Recovery prompt generation failed.${C_RESET}\n"
-        RECOVER_ACTION="cancel"; return
-    fi
-
-    echo "$recovery_prompt" > "$primary"
-    echo ""
-    printf "${C_GREEN}  Recovery prompt saved to:${C_RESET}\n"
-    echo "    $primary"
-    echo ""
-    echo "  Edit it if you want, or just tell Claude to use it as the first message of the conversation."
-    printf "${C_CYAN}  Opening a fresh Claude session in that directory now...${C_RESET}\n"
-    echo ""
-    RECOVER_ACTION="fresh"
 }
 
-# --- Section 11.12: Do-DeleteSession ---
-swap_session_guid() {
-    # Replace old GUID with new GUID for the matching entry; reset its tokens field.
-    # Used by the recovery 'fresh' branch after a successful launch.
-    local old_guid="$1" new_guid="$2"
-    [[ -z "$old_guid" || -z "$new_guid" ]] && return
-    [[ -n "$NODE_EXE" ]] || return
-    acquire_sessions_lock
-    "$NODE_EXE" -e "
-        const fs = require('fs');
-        const p = '$SESSIONS_FILE';
-        const lines = fs.readFileSync(p, 'utf8').split('\n');
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i] === '[archived]') break;
-            const parts = lines[i].split('|');
-            if (parts[0] === '$old_guid') {
-                parts[0] = '$new_guid';
-                if (parts.length >= 4) parts[3] = '';
-                lines[i] = parts.join('|');
-            }
-        }
-        fs.writeFileSync(p, lines.join('\n'));
-    " 2>/dev/null
-    release_sessions_lock
-}
-
-do_delete_session() {
-    local guid="$1" dir="$2"
-    local proj_key proj_dir_claude
-    proj_key=$(get_proj_key "$dir")
-    proj_dir_claude="$HOME/.claude/projects/$proj_key"
-    [[ -f "$proj_dir_claude/$guid.jsonl" ]] && rm -f "$proj_dir_claude/$guid.jsonl"
-    [[ -d "$proj_dir_claude/$guid" ]] && rm -rf "$proj_dir_claude/$guid"
-    sync_session_index "$dir"
-}
-
-# --- Section 11.13: Do-Trim ---
-TRIM_NEW_GUID=""
-do_trim() {
-    TRIM_NEW_GUID=""
+# ==================================================================
+# Do-Trim (cmv-driven trim, fail-loud cross-project)
+# ==================================================================
+# Sets __cm_trim_new_guid on success.
+__cm_do_trim() {
+    __cm_trim_new_guid=""
     local current_guid="$1"
-    if [[ ! -x "$CMV_EXE" ]] && ! command -v "$CMV_EXE" >/dev/null 2>&1; then
-        echo "  cmv not found. Skipping trim."
-        return
-    fi
-
-    # Pre-trim cleanup of stale .cmv-trim-tmp (older than 5 min)
-    local sess_line entry_dir proj_key proj_dir_claude
-    sess_line=$(grep "^$current_guid|" "$SESSIONS_FILE" | head -1)
-    if [[ -n "$sess_line" ]]; then
-        entry_dir=$(echo "$sess_line" | cut -d'|' -f2)
-        proj_key=$(get_proj_key "$entry_dir")
-        proj_dir_claude="$HOME/.claude/projects/$proj_key"
-        if [[ -d "$proj_dir_claude" ]]; then
-            local cutoff=$((SECONDS + 0))  # placeholder; use absolute epoch
-            local now_epoch
-            now_epoch=$(date +%s)
-            local fmt
-            for fmt in "$proj_dir_claude"/*.cmv-trim-tmp; do
-                [[ -f "$fmt" ]] || continue
-                local mt
-                mt=$(stat -c%Y "$fmt" 2>/dev/null || stat -f%m "$fmt" 2>/dev/null)
-                if (( now_epoch - mt > 300 )); then
-                    printf "${C_GRAY}  Cleaned stale CMV temp file: %s${C_RESET}\n" "$(basename "$fmt")"
-                    rm -f "$fmt"
+    local cmv_exe; cmv_exe=$(__cm_resolve_cmv) || { __cm_say "cmv not found. Skipping trim."; return; }
+    # Pre-trim cleanup: stale .cmv-trim-tmp older than 5 minutes.
+    local sessions=() s
+    mapfile -t sessions < <(__cm_get_sessions)
+    local entry=""
+    for s in "${sessions[@]}"; do
+        local g d desc t; IFS='|' read -r g d desc t <<< "$s"
+        if [[ "$g" == "$current_guid" ]]; then entry="$s"; break; fi
+    done
+    if [[ -n "$entry" ]]; then
+        local g d _desc _t; IFS='|' read -r g d _desc _t <<< "$entry"
+        local pk pd; pk=$(__cm_get_proj_key "$d"); pd="$HOME/.claude/projects/$pk"
+        if [[ -d "$pd" ]]; then
+            local cutoff; cutoff=$(( $(date +%s) - 300 ))
+            local f
+            for f in "$pd"/*.cmv-trim-tmp; do
+                [[ -f "$f" ]] || continue
+                local m; m=$(__cm_file_mtime_epoch "$f")
+                if (( m < cutoff )); then
+                    __cm_say_c "$__CM_C_DARKGRAY" "Cleaned stale CMV temp file: $(basename "$f")"
+                    rm -f "$f" 2>/dev/null
                 fi
             done
         fi
     fi
-
-    echo "  Trimming session..."
-    local trim_started_at
-    trim_started_at=$(date +%s)
-    local trim_output
-    trim_output=$("$CMV_EXE" trim -s "$current_guid" --skip-launch 2>&1)
+    __cm_say "Trimming session..."
+    local trim_started; trim_started=$(date +%s)
+    local trim_output; trim_output=$("$cmv_exe" trim -s "$current_guid" --skip-launch 2>&1)
     local new_guid
-    new_guid=$(echo "$trim_output" | grep -oE 'Session ID:[[:space:]]*[0-9a-f-]+' | head -1 | grep -oE '[0-9a-f-]{36}')
+    new_guid=$(printf '%s' "$trim_output" | grep -oE 'Session ID:\s*[0-9a-f-]+' | head -1 | sed -E 's/.*Session ID:\s*//')
     if [[ -z "$new_guid" ]]; then
-        echo "  Trim failed or no new session ID found."
-        echo "$trim_output" | head -5 | sed 's/^/  /'
+        __cm_say "Trim failed or no new session ID found."
+        printf '%s\n' "$trim_output" | head -5 | sed 's/^/  /'
         return
     fi
-
-    # Update sessions.txt: replace old GUID with new
-    acquire_sessions_lock
-    sed -i "s|^${current_guid}|${new_guid}|" "$SESSIONS_FILE"
-    release_sessions_lock
-
-    # Verify trimmed JSONL is in expected project dir; FAIL LOUDLY if not
-    local entry expected_dir expected_file
-    entry=$(grep "^$new_guid|" "$SESSIONS_FILE" | head -1)
-    if [[ -n "$entry" ]]; then
-        local entry_d
-        entry_d=$(echo "$entry" | cut -d'|' -f2)
-        local pk
-        pk=$(get_proj_key "$entry_d")
-        expected_dir="$HOME/.claude/projects/$pk"
-        expected_file="$expected_dir/$new_guid.jsonl"
-        if [[ ! -f "$expected_file" ]]; then
-            local actual
-            actual=$(find "$HOME/.claude/projects" -maxdepth 2 -name "$new_guid.jsonl" 2>/dev/null | head -1)
+    # Update sessions.txt: replace current_guid with new_guid.
+    local updated=() line
+    for line in "${sessions[@]}"; do
+        local g d desc t; IFS='|' read -r g d desc t <<< "$line"
+        if [[ "$g" == "$current_guid" ]]; then updated+=("$new_guid|$d|$desc|$t")
+        else updated+=("$line"); fi
+    done
+    __cm_save_sessions "${updated[@]}"
+    # Verify trimmed JSONL is in the expected project dir. Fail loud if not.
+    local looked_up="" lu
+    mapfile -t sessions < <(__cm_get_sessions)
+    for lu in "${sessions[@]}"; do
+        local g _d _desc _t; IFS='|' read -r g _d _desc _t <<< "$lu"
+        [[ "$g" == "$new_guid" ]] && { looked_up="$lu"; break; }
+    done
+    if [[ -n "$looked_up" ]]; then
+        local g d _desc _t; IFS='|' read -r g d _desc _t <<< "$looked_up"
+        local pk pd expected; pk=$(__cm_get_proj_key "$d"); pd="$HOME/.claude/projects/$pk"
+        expected="$pd/$new_guid.jsonl"
+        if [[ ! -f "$expected" ]]; then
+            local actual; actual=$(ls -1 "$HOME"/.claude/projects/*/"$new_guid.jsonl" 2>/dev/null | head -1)
             if [[ -n "$actual" ]]; then
-                echo ""
-                printf "${C_RED}  CMV WROTE THE TRIMMED SESSION TO THE WRONG PROJECT${C_RESET}\n"
-                printf "${C_RED}  Expected: %s${C_RESET}\n" "$expected_file"
-                printf "${C_RED}  Actual:   %s${C_RESET}\n" "$actual"
-                echo "  Investigate before resuming. ClaudeCM will NOT silently copy the file."
+                __cm_blank
+                __cm_say_c "$__CM_C_RED" "CMV WROTE THE TRIMMED SESSION TO THE WRONG PROJECT"
+                __cm_say_c "$__CM_C_RED" "Expected: $expected"
+                __cm_say_c "$__CM_C_RED" "Actual:   $actual"
+                __cm_say "Investigate before resuming. ClaudeCM will NOT silently copy the file."
             else
-                echo ""
-                printf "${C_RED}  Trim claimed to create %s but the file is not on disk.${C_RESET}\n" "$new_guid"
+                __cm_blank
+                __cm_say_c "$__CM_C_RED" "Trim claimed to create $new_guid but the file is not on disk."
             fi
         fi
     fi
-
-    echo "$trim_output" | grep -v 'Session ID:' | grep -v '^[[:space:]]*$' | head -10 | sed 's/^/  /'
-
-    # Post-trim cleanup of .cmv-trim-tmp files modified since trim started
-    if [[ -d "$proj_dir_claude" ]]; then
-        local fmt mt
-        for fmt in "$proj_dir_claude"/*.cmv-trim-tmp; do
-            [[ -f "$fmt" ]] || continue
-            mt=$(stat -c%Y "$fmt" 2>/dev/null || stat -f%m "$fmt" 2>/dev/null)
-            if (( mt >= trim_started_at )); then
-                printf "${C_GRAY}  CMV left a temp file behind: %s; removing.${C_RESET}\n" "$(basename "$fmt")"
-                rm -f "$fmt"
-            fi
-        done
+    # Print remaining output (first 10 non-Session-ID lines).
+    printf '%s\n' "$trim_output" | grep -v 'Session ID:' | sed '/^$/d' | head -10 | sed 's/^/  /'
+    # Post-trim cleanup of *.cmv-trim-tmp files modified during this run.
+    if [[ -n "$looked_up" ]]; then
+        local g d _desc _t; IFS='|' read -r g d _desc _t <<< "$looked_up"
+        local pk pd; pk=$(__cm_get_proj_key "$d"); pd="$HOME/.claude/projects/$pk"
+        if [[ -d "$pd" ]]; then
+            local f
+            for f in "$pd"/*.cmv-trim-tmp; do
+                [[ -f "$f" ]] || continue
+                local m; m=$(__cm_file_mtime_epoch "$f")
+                if (( m >= trim_started )); then
+                    __cm_say_c "$__CM_C_DARKGRAY" "CMV left a temp file behind: $(basename "$f"); removing."
+                    rm -f "$f" 2>/dev/null
+                fi
+            done
+        fi
+        __cm_sync_session_index "$d"
     fi
-
-    echo ""
-    echo "  Session trimmed. New ID: $new_guid"
-    TRIM_NEW_GUID="$new_guid"
+    __cm_blank
+    __cm_say "Session trimmed. New ID: $new_guid"
+    __cm_trim_new_guid="$new_guid"
 }
 
-# --- Section 11.14: Do-Refresh ---
-locate_extract_skeleton() {
-    local script_dir
-    script_dir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
-    local candidates=(
-        "$script_dir/extract-skeleton.mjs"
-        "${CLAUDECM_HOME:-}/extract-skeleton.mjs"
-        "$HOME/.claudecm/extract-skeleton.mjs"
-        "$HOME/.local/share/claudecm/extract-skeleton.mjs"
-    )
-    local c
-    for c in "${candidates[@]}"; do
-        [[ -n "$c" && -f "$c" ]] && { echo "$c"; return 0; }
-    done
-    return 1
-}
-
-do_refresh() {
+# ==================================================================
+# Do-Refresh — structured compaction; prompt piped via stdin
+# ==================================================================
+__cm_do_refresh() {
     local current_guid="$1"
-    local sess_line cur_desc="Unnamed" cur_dir
+    local sessions=() s
+    mapfile -t sessions < <(__cm_get_sessions)
+    local cur_desc="Unnamed" cur_dir
     cur_dir=$(pwd)
-    sess_line=$(grep "^$current_guid|" "$SESSIONS_FILE" | head -1)
-    if [[ -n "$sess_line" ]]; then
-        cur_desc=$(echo "$sess_line" | cut -d'|' -f3)
-        cur_dir=$(echo "$sess_line" | cut -d'|' -f2)
-    fi
-
-    echo ""
-    read -rp "  Name for new session (Enter for '$cur_desc'): " new_name
+    for s in "${sessions[@]}"; do
+        local g d desc t; IFS='|' read -r g d desc t <<< "$s"
+        if [[ "$g" == "$current_guid" ]]; then cur_desc="$desc"; cur_dir="$d"; break; fi
+    done
+    __cm_blank
+    local new_name; read -rp "  Name for new session (Enter for '$cur_desc'): " new_name
     [[ -z "$new_name" ]] && new_name="$cur_desc"
-
-    # Per-operation temp dir + cleanup of stale ones
-    mkdir -p "$REFRESH_TEMP_ROOT"
-    find "$REFRESH_TEMP_ROOT" -maxdepth 1 -mindepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null
-    local refresh_op_id refresh_temp_dir
-    refresh_op_id="$(date +%Y%m%d-%H%M%S)-$current_guid"
-    refresh_temp_dir="$REFRESH_TEMP_ROOT/$refresh_op_id"
-    mkdir -p "$refresh_temp_dir"
-
-    local proj_key proj_dir_claude old_jsonl extract_script
-    proj_key=$(get_proj_key "$cur_dir")
+    # Skeleton extraction setup.
+    local proj_key proj_dir_claude old_jsonl
+    proj_key=$(__cm_get_proj_key "$cur_dir")
     proj_dir_claude="$HOME/.claude/projects/$proj_key"
     old_jsonl="$proj_dir_claude/$current_guid.jsonl"
-
+    local refresh_root="$__cm_cm_dir/refresh-temp"
+    mkdir -p "$refresh_root" 2>/dev/null
+    # Clean up subdirs older than 24h (best-effort).
+    find "$refresh_root" -maxdepth 1 -mindepth 1 -type d -mtime +0 -exec rm -rf {} + 2>/dev/null
+    local op_id; op_id="$(date +%Y%m%d-%H%M%S)-$current_guid"
+    local refresh_temp_dir="$refresh_root/$op_id"
+    mkdir -p "$refresh_temp_dir" 2>/dev/null
     local skeleton_content="" transcript_path=""
-    if extract_script=$(locate_extract_skeleton); then
-        if [[ -f "$old_jsonl" && -n "$NODE_EXE" ]]; then
-            echo ""
-            echo "  Extracting session skeleton..."
-            "$NODE_EXE" "$extract_script" "$old_jsonl" "$cur_desc" "$refresh_temp_dir" >/dev/null 2>&1 || true
-            local skel_file="$refresh_temp_dir/$current_guid-skeleton.md"
-            local tx_file="$refresh_temp_dir/$current_guid-transcript.md"
-            if [[ -f "$skel_file" ]]; then
-                skeleton_content=$(cat "$skel_file")
-                printf "${C_GREEN}  Skeleton extracted.${C_RESET}\n"
-            fi
-            if [[ -f "$tx_file" ]]; then
-                transcript_path="$tx_file"
-                local tx_size
-                tx_size=$(awk "BEGIN{printf \"%.0f KB\", $(stat -c%s "$tx_file" 2>/dev/null || stat -f%z "$tx_file")/1024}")
-                printf "${C_GREEN}  Filtered transcript: %s${C_RESET}\n" "$tx_size"
-            fi
+    # Locate extract-skeleton.mjs.
+    local extract_script=""
+    local script_dir; script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+    local candidates=()
+    [[ -n "$script_dir" ]] && candidates+=("$script_dir/extract-skeleton.mjs")
+    [[ -n "$CLAUDECM_HOME" ]] && candidates+=("$CLAUDECM_HOME/extract-skeleton.mjs")
+    candidates+=("$HOME/.claudecm/extract-skeleton.mjs" "$HOME/.local/share/claudecm/extract-skeleton.mjs")
+    local c
+    for c in "${candidates[@]}"; do
+        [[ -n "$c" && -f "$c" ]] && { extract_script="$c"; break; }
+    done
+    local node; node=$(__cm_resolve_node || true)
+    if [[ -f "$old_jsonl" && -n "$extract_script" && -n "$node" ]]; then
+        __cm_blank
+        __cm_say "Extracting session skeleton..."
+        "$node" "$extract_script" "$old_jsonl" "$cur_desc" "$refresh_temp_dir" >/dev/null 2>&1
+        local skel_file="$refresh_temp_dir/$current_guid-skeleton.md"
+        local tx_file="$refresh_temp_dir/$current_guid-transcript.md"
+        if [[ -f "$skel_file" ]]; then
+            skeleton_content=$(<"$skel_file")
+            __cm_say_c "$__CM_C_GREEN" "Skeleton extracted."
+        fi
+        if [[ -f "$tx_file" ]]; then
+            transcript_path="$tx_file"
+            local tx_kb; tx_kb=$(( ($(__cm_file_size "$tx_file") + 512) / 1024 ))
+            __cm_say_c "$__CM_C_GREEN" "Filtered transcript: $tx_kb KB"
         fi
     else
-        printf "${C_YELLOW}  extract-skeleton.mjs not found, skipping skeleton extraction.${C_RESET}\n"
+        [[ ! -f "$old_jsonl" ]]         && __cm_say_c "$__CM_C_YELLOW" "Old session JSONL not found, skipping skeleton extraction."
+        [[ -z "$extract_script" ]]       && __cm_say_c "$__CM_C_YELLOW" "extract-skeleton.mjs not found, skipping skeleton extraction."
+        [[ -z "$node" ]]                 && __cm_say_c "$__CM_C_YELLOW" "Node.js not found, skipping skeleton extraction."
     fi
-
-    # Build refresh prompt
-    local refresh_prompt
-    refresh_prompt=$(cat <<EOF
+    # Build refresh prompt.
+    local prompt_file="$__cm_cm_dir/refresh-prompt.tmp"
+    {
+        cat <<'HEAD'
 Read your memories. This is a fresh session replacing a long previous conversation
 on this project. Everything you need to know is in:
 
@@ -1002,875 +1022,645 @@ on this project. Everything you need to know is in:
 2) Any documentation in the project directory
 3) The codebase itself (git log for history)
 4) project_current_state.md in your memory if it exists
-EOF
-)
-    if [[ -n "$skeleton_content" || -n "$transcript_path" ]]; then
-        refresh_prompt+=$'\n5) The structured extraction below, produced by mechanical analysis of the\n   conversation log'
-        if [[ -n "$transcript_path" ]]; then
-            refresh_prompt+=$'\n6) A filtered transcript of the previous session (conversation text and tool call'
-            refresh_prompt+=$'\n   summaries, no tool output) at:'
-            refresh_prompt+=$'\n   '"$transcript_path"
-            refresh_prompt+=$'\n   Read this file and identify any key decisions, user corrections, or reasoning'
-            refresh_prompt+=$'\n   that the skeleton below does not capture.'
+HEAD
+        if [[ -n "$skeleton_content" || -n "$transcript_path" ]]; then
+            printf '5) The structured extraction below, produced by mechanical analysis of the\n   conversation log\n'
+            if [[ -n "$transcript_path" ]]; then
+                printf '6) A filtered transcript of the previous session (conversation text and tool call\n   summaries, no tool output) at:\n   %s\n   Read this file and identify any key decisions, user corrections, or reasoning\n   that the skeleton below does not capture.\n' "$transcript_path"
+            fi
         fi
+        cat <<'TAIL'
+
+IMPORTANT:
+- The files listed below reflect the state at the end of the previous session.
+  Re-read any file before modifying it, as it may have changed since then.
+- The errors listed may or may not still be relevant. Verify before acting on them.
+- Do not start any development until the user tells you to.
+- Tell the user what you understand about the current state of the project,
+  what works, what is pending, and what your behavioral rules are.
+TAIL
+        if [[ -n "$skeleton_content" ]]; then
+            printf '\n\n--- ADD YOUR NOTES HERE (context, decisions, corrections, anything the skeleton missed) ---\n\n\n\n--- SKELETON START (review and edit as needed) ---\n\n%s\n\n--- SKELETON END ---\n' "$skeleton_content"
+        fi
+    } > "$prompt_file"
+    local edit_ans; read -rp "  Would you like to view/edit the compaction prompt and skeleton before proceeding? (Save and close when done) [y/N]: " edit_ans
+    if [[ "$edit_ans" == "y" || "$edit_ans" == "Y" ]]; then
+        "${EDITOR:-nano}" "$prompt_file"
     fi
-    refresh_prompt+=$'\n\nIMPORTANT:\n- The files listed below reflect the state at the end of the previous session.\n  Re-read any file before modifying it, as it may have changed since then.\n- The errors listed may or may not still be relevant. Verify before acting on them.\n- Do not start any development until the user tells you to.\n- Tell the user what you understand about the current state of the project,\n  what works, what is pending, and what your behavioral rules are.'
-    if [[ -n "$skeleton_content" ]]; then
-        refresh_prompt+=$'\n\n--- ADD YOUR NOTES HERE (context, decisions, corrections, anything the skeleton missed) ---\n\n\n\n--- SKELETON START (review and edit as needed) ---\n\n'"$skeleton_content"$'\n\n--- SKELETON END ---'
+    local refresh_orig; refresh_orig=$(pwd)
+    cd "$cur_dir" || true
+    __cm_blank
+    __cm_say "Creating fresh session, please wait..."
+    local claude_exe; claude_exe=$(__cm_resolve_claude)
+    # Spec-critical: pipe via stdin. Never pass the prompt as a -p argument.
+    # Windows' 32K CreateProcess limit is the known failure mode; Linux usually has
+    # higher limits but the stdin pattern is the authoritative approach per spec 11.14 step 11.
+    local refresh_json=""
+    if [[ -n "$claude_exe" ]]; then
+        refresh_json=$("$claude_exe" --dangerously-skip-permissions -p --output-format json < "$prompt_file" 2>&1)
     fi
-
-    local prompt_file="$CM_DIR/refresh-prompt.tmp"
-    echo "$refresh_prompt" > "$prompt_file"
-
-    read -rp "  Would you like to view/edit the compaction prompt and skeleton before proceeding? (Save and close when done) [y/N] " edit_prompt
-    if [[ "$edit_prompt" =~ ^[yY]$ ]]; then
-        "$EDITOR" "$prompt_file"
-    fi
-    local prompt_text
-    prompt_text=$(cat "$prompt_file")
-    rm -f "$prompt_file"
-
-    local refresh_orig_dir
-    refresh_orig_dir=$(pwd)
-    cd "$cur_dir" || return
-    echo ""
-    echo "  Creating fresh session, please wait..."
-    "$CLAUDE_EXE" --dangerously-skip-permissions -p "$prompt_text" >/dev/null 2>&1
-    echo "  Done."
-    cd "$refresh_orig_dir"
-
-    # Find new session GUID
-    local fresh_guid
-    fresh_guid=$(ls -t "$proj_dir_claude"/*.jsonl 2>/dev/null | while read -r f; do
-        local g; g=$(basename "$f" .jsonl)
-        [[ "$g" != "$current_guid" ]] && { echo "$g"; break; }
-    done)
+    rm -f "$prompt_file" 2>/dev/null
+    __cm_say "Done."
+    cd "$refresh_orig" || true
+    # Authoritative: extract session_id from JSON. Never fall back to filesystem scan.
+    local fresh_guid; fresh_guid=$(__cm_json_get "$refresh_json" "session_id")
     if [[ -z "$fresh_guid" ]]; then
-        printf "${C_YELLOW}  Warning: Refresh did not create a new session. The old session is unchanged.${C_RESET}\n"
-        rm -rf "$refresh_temp_dir" 2>/dev/null
+        __cm_say_c "$__CM_C_YELLOW" "Warning: Refresh did not create a new session. The old session is unchanged."
         return
     fi
-
-    # Get token count for fresh session via cmv -s (never --latest)
+    # Rewrite sessions: fresh at top, old with incremented (old N) suffix at bottom.
+    mapfile -t sessions < <(__cm_get_sessions)
+    local old_entry="" others=()
+    local base_desc="" old_dir=""
+    for s in "${sessions[@]}"; do
+        local g d desc t; IFS='|' read -r g d desc t <<< "$s"
+        if [[ "$g" == "$current_guid" ]]; then
+            base_desc=$(printf '%s' "$desc" | sed -E 's/[[:space:]]*\(old([[:space:]]+[0-9]+)?\)[[:space:]]*$//')
+            old_dir="$d"
+            # Collect (old N) numbers in use for same base+dir.
+            local used=() other
+            for other in "${sessions[@]}"; do
+                local og od odesc ot; IFS='|' read -r og od odesc ot <<< "$other"
+                [[ "$og" == "$current_guid" ]] && continue
+                [[ "$od" != "$d" ]] && continue
+                local od_base="" od_n=""
+                if [[ "$odesc" =~ ^(.*)[[:space:]]+\(old[[:space:]]+([0-9]+)\)[[:space:]]*$ ]]; then
+                    od_base=$(printf '%s' "${BASH_REMATCH[1]}" | sed -E 's/[[:space:]]+$//')
+                    od_n="${BASH_REMATCH[2]}"
+                elif [[ "$odesc" =~ ^(.*)[[:space:]]*\(old\)[[:space:]]*$ ]]; then
+                    od_base=$(printf '%s' "${BASH_REMATCH[1]}" | sed -E 's/[[:space:]]+$//')
+                    od_n="1"
+                fi
+                if [[ -n "$od_n" && "$od_base" == "$base_desc" ]]; then used+=("$od_n"); fi
+            done
+            local old_desc
+            if (( ${#used[@]} == 0 )); then old_desc="$base_desc (old)"
+            else
+                local n=1 u
+                while :; do
+                    local hit=0
+                    for u in "${used[@]}"; do (( u == n )) && { hit=1; break; }; done
+                    (( hit )) || break
+                    n=$((n + 1))
+                done
+                if (( n == 1 )); then old_desc="$base_desc (old)"; else old_desc="$base_desc (old $n)"; fi
+            fi
+            old_entry="$g|$d|$old_desc|$t"
+        else
+            others+=("$s")
+        fi
+    done
+    # Token count via cmv.
     local fresh_tokens=""
-    if command -v "$CMV_EXE" >/dev/null 2>&1 || [[ -x "$CMV_EXE" ]]; then
-        local bench_out
-        bench_out=$("$CMV_EXE" benchmark -s "$fresh_guid" --json 2>&1)
-        fresh_tokens=$(echo "$bench_out" | grep -oE '"preTrimTokens"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+    local cmv_exe; cmv_exe=$(__cm_resolve_cmv || true)
+    if [[ -n "$cmv_exe" ]]; then
+        local bo; bo=$("$cmv_exe" benchmark -s "$fresh_guid" --json 2>&1)
+        fresh_tokens=$(printf '%s' "$bo" | grep -oE '"preTrimTokens"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
     fi
-
-    # Rebuild sessions: new entry on top, others in place, old entry at bottom with (old) suffix
-    acquire_sessions_lock
-    local main_tmp arch_tmp
-    main_tmp=$(mktemp); arch_tmp=$(mktemp)
-    local in_archived=false
-    local old_desc="" had_old=false
-    while IFS= read -r line; do
-        if [[ "$line" == "[archived]" ]]; then in_archived=true; echo "[archived]" >> "$arch_tmp"; continue; fi
-        if $in_archived; then [[ -n "$line" ]] && echo "$line" >> "$arch_tmp"; continue; fi
-        [[ -z "$line" ]] && continue
-        local g; g=$(echo "$line" | cut -d'|' -f1)
-            if [[ "$g" == "$current_guid" ]]; then
-                had_old=true
-                local d s base_desc
-                d=$(echo "$line" | cut -d'|' -f2)
-                t=$(echo "$line" | cut -d'|' -f3)
-                s=$(echo "$line" | cut -d'|' -f4)
-                base_desc=$(echo "$t" | sed -E 's/[[:space:]]*\(old([[:space:]]+[0-9]+)?\)[[:space:]]*$//')
-                local max_old=0 n
-                while IFS= read -r scan_line; do
-                    [[ "$scan_line" == "[archived]" ]] && break
-                    [[ -z "$scan_line" ]] && continue
-                    local sg sd st
-                    sg=$(echo "$scan_line" | cut -d'|' -f1)
-                    [[ "$sg" == "$current_guid" ]] && continue
-                    sd=$(echo "$scan_line" | cut -d'|' -f2)
-                    [[ "$sd" != "$d" ]] && continue
-                    st=$(echo "$scan_line" | cut -d'|' -f3)
-                    if [[ "$st" == "$base_desc (old)" ]]; then
-                        [[ $max_old -lt 1 ]] && max_old=1
-                    elif [[ "$st" == "$base_desc (old "*")" ]]; then
-                        local num_part="${st#$base_desc (old }"
-                        num_part="${num_part%)}"
-                        if [[ "$num_part" =~ ^[0-9]+$ ]]; then
-                            n="$num_part"
-                            [[ $n -gt $max_old ]] && max_old=$n
-                        fi
-                    fi
-                done < "$SESSIONS_FILE"
-                local next_num=$((max_old + 1))
-                if [[ $next_num -eq 1 ]]; then
-                    old_desc="$base_desc (old)"
-                else
-                    old_desc="$base_desc (old $next_num)"
-                fi
-                echo "$current_guid|$d|$old_desc|$s" > "$main_tmp.old"
-            else
-                echo "$line" >> "$main_tmp"
-            fi
-    done < "$SESSIONS_FILE"
-
-    {
-        echo "$fresh_guid|$cur_dir|$new_name|$fresh_tokens"
-        cat "$main_tmp"
-        $had_old && cat "$main_tmp.old"
-        cat "$arch_tmp"
-    } | write_sessions_atomic
-    rm -f "$main_tmp" "$main_tmp.old" "$arch_tmp"
-    release_sessions_lock
-
-    echo ""
-    echo "  Fresh session created: $new_name"
-    echo "  Old session moved to bottom of list."
-
-    rm -rf "$refresh_temp_dir" 2>/dev/null
+    __cm_sync_session_index "$cur_dir"
+    local new_list=("$fresh_guid|$cur_dir|$new_name|$fresh_tokens" "${others[@]}")
+    [[ -n "$old_entry" ]] && new_list+=("$old_entry")
+    __cm_save_sessions "${new_list[@]}"
+    __cm_blank
+    __cm_say "Fresh session created: $new_name"
+    __cm_say "Old session moved to bottom of list."
+    [[ -d "$refresh_temp_dir" ]] && rm -rf "$refresh_temp_dir" 2>/dev/null
 }
 
-# --- Section 11.15: Do-PostExit ---
-do_post_exit() {
+# ==================================================================
+# Do-PostExit
+# ==================================================================
+__cm_do_post_exit() {
     local known_guid="${1:-}"
-    echo ""
-    echo "  Session ended."
-    echo ""
-
-    # Resolve GUID (project-scoped, NEVER cross-project)
-    local guid="$known_guid"
-    if [[ -z "$guid" ]]; then
-        local proj_key proj_dir_claude
-        proj_key=$(get_proj_key "$(pwd)")
-        proj_dir_claude="$HOME/.claude/projects/$proj_key"
-        [[ -d "$proj_dir_claude" ]] || return
-        guid=$(ls -t "$proj_dir_claude"/*.jsonl 2>/dev/null | while read -r f; do
-            local n; n=$(basename "$f" .jsonl)
-            case "$n" in agent-*) ;; *) echo "$n"; break ;; esac
-        done)
-        [[ -z "$guid" ]] && return
+    __cm_blank
+    __cm_say "Session ended."
+    __cm_blank
+    local guid=""
+    if [[ -n "$known_guid" ]]; then
+        guid="$known_guid"
+    else
+        # Project-scoped fallback to newest non-agent-* JSONL in current project key dir.
+        local pk pd; pk=$(__cm_get_proj_key "$(pwd)"); pd="$HOME/.claude/projects/$pk"
+        [[ -d "$pd" ]] || return 0
+        local newest=""
+        while IFS= read -r f; do
+            local bn; bn=$(basename "$f")
+            [[ "$bn" =~ ^agent- ]] && continue
+            newest="$f"; break
+        done < <(ls -1t "$pd"/*.jsonl 2>/dev/null)
+        [[ -z "$newest" ]] && return 0
+        guid=$(basename "$newest" .jsonl)
     fi
-
-    # Auto-snapshot via cmv -s (NEVER --latest)
-    if command -v "$CMV_EXE" >/dev/null 2>&1 || [[ -x "$CMV_EXE" ]]; then
+    # Auto-snapshot via cmv (always -s <guid>, never --latest).
+    local cmv_exe; cmv_exe=$(__cm_resolve_cmv || true)
+    if [[ -n "$cmv_exe" ]]; then
         local snap_label="auto-exit-$(date +%Y%m%d-%H%M%S)"
-        ("$CMV_EXE" snapshot "$snap_label" -s "$guid" >/dev/null 2>&1) &
-        local snap_pid=$!
-        local spin=('-' '\' '|' '/')
-        local i=0
-        while kill -0 "$snap_pid" 2>/dev/null; do
-            printf "\r  %s Saving snapshot..." "${spin[$((i % 4))]}"
-            sleep 0.1
-            ((i++))
-        done
-        printf "\r  Done.                        \n"
+        printf '  - Saving snapshot...\r'
+        local spin_pid=""
+        ( local i=0 spin="-\\|/"
+          while :; do
+              printf '  %s Saving snapshot...\r' "${spin:$((i%4)):1}"
+              sleep 0.1; i=$((i+1))
+          done ) &
+        spin_pid=$!
+        "$cmv_exe" snapshot "$snap_label" -s "$guid" >/dev/null 2>&1
+        kill "$spin_pid" 2>/dev/null; wait "$spin_pid" 2>/dev/null
+        printf '  Done.                        \n'
     fi
-
-    # Look up entry, update or register
-    local existing
-    existing=$(grep "^$guid|" "$SESSIONS_FILE" | head -1)
-    if [[ -n "$existing" ]]; then
-        local fresh_tokens=""
-        if command -v "$CMV_EXE" >/dev/null 2>&1 || [[ -x "$CMV_EXE" ]]; then
-            local bench_out
-            bench_out=$("$CMV_EXE" benchmark -s "$guid" --json 2>&1)
-            fresh_tokens=$(echo "$bench_out" | grep -oE '"preTrimTokens"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+    # Locate entry; update tokens or register new.
+    local sessions=() s
+    mapfile -t sessions < <(__cm_get_sessions)
+    local found_idx=-1 i=0
+    for s in "${sessions[@]}"; do
+        local g _d _desc _t; IFS='|' read -r g _d _desc _t <<< "$s"
+        [[ "$g" == "$guid" ]] && { found_idx=$i; break; }
+        i=$((i+1))
+    done
+    if (( found_idx >= 0 )); then
+        local g d desc t; IFS='|' read -r g d desc t <<< "${sessions[found_idx]}"
+        if [[ -n "$cmv_exe" ]]; then
+            local bo; bo=$("$cmv_exe" benchmark -s "$guid" --json 2>&1)
+            local new_tokens; new_tokens=$(printf '%s' "$bo" | grep -oE '"preTrimTokens"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
+            [[ -n "$new_tokens" ]] && t="$new_tokens"
         fi
-        local d desc
-        d=$(echo "$existing" | cut -d'|' -f2)
-        desc=$(echo "$existing" | cut -d'|' -f3)
-        # Move to top with updated tokens
-        acquire_sessions_lock
-        local main_tmp arch_tmp
-        main_tmp=$(mktemp); arch_tmp=$(mktemp)
-        local in_archived=false
-        while IFS= read -r line; do
-            if [[ "$line" == "[archived]" ]]; then in_archived=true; echo "[archived]" >> "$arch_tmp"; continue; fi
-            if $in_archived; then [[ -n "$line" ]] && echo "$line" >> "$arch_tmp"; continue; fi
-            [[ -z "$line" ]] && continue
-            local g; g=$(echo "$line" | cut -d'|' -f1)
-            [[ "$g" == "$guid" ]] && continue
-            echo "$line" >> "$main_tmp"
-        done < "$SESSIONS_FILE"
-        {
-            echo "$guid|$d|$desc|${fresh_tokens:-$(echo "$existing" | cut -d'|' -f4)}"
-            cat "$main_tmp"
-            cat "$arch_tmp"
-        } | write_sessions_atomic
-        rm -f "$main_tmp" "$arch_tmp"
-        release_sessions_lock
+        local top="$g|$d|$desc|$t"
+        local rest=() j
+        for (( j=0; j<${#sessions[@]}; j++ )); do (( j != found_idx )) && rest+=("${sessions[j]}"); done
+        __cm_save_sessions "$top" "${rest[@]}"
     else
-        echo ""
-        local folder_default
-        folder_default=$(basename "$(pwd)" | tr '-' ' ' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)}1')
-        read -rp "  Describe this session (Enter for '$folder_default', 'skip' to skip): " desc
+        __cm_blank
+        local folder; folder=$(basename "$(pwd)")
+        folder="${folder//-/ }"
+        # Title case (POSIX sh-friendly-ish)
+        folder=$(printf '%s' "$folder" | awk '{for(i=1;i<=NF;i++)$i=toupper(substr($i,1,1)) tolower(substr($i,2)); print}')
+        local desc
+        read -rp "  Describe this session (Enter for '$folder', 'skip' to skip): " desc
         [[ "$desc" == "skip" ]] && return
-        [[ -z "$desc" ]] && desc="$folder_default"
-        acquire_sessions_lock
-        local tmp; tmp=$(mktemp)
-        echo "$guid|$(pwd)|$desc|" > "$tmp"
-        cat "$SESSIONS_FILE" >> "$tmp"
-        mv "$tmp" "$SESSIONS_FILE"
-        release_sessions_lock
+        [[ -z "$desc" ]] && desc="$folder"
+        local new_entry="$guid|$(pwd)|$desc|"
+        __cm_save_sessions "$new_entry" "${sessions[@]}"
     fi
-
-    # Sync session index
-    local cur_line
-    cur_line=$(grep "^$guid|" "$SESSIONS_FILE" | head -1)
-    if [[ -n "$cur_line" ]]; then
-        local sd; sd=$(echo "$cur_line" | cut -d'|' -f2)
-        sync_session_index "$sd"
-    fi
-
-    # Show size and offer trim/refresh
-    if [[ -n "$cur_line" ]]; then
-        local d t info size_str tok_str
-        d=$(echo "$cur_line" | cut -d'|' -f2)
-        t=$(echo "$cur_line" | cut -d'|' -f4)
-        info=$(get_session_info "$guid" "$d" "$t")
-        size_str=$(echo "$info" | cut -d'|' -f1)
-        tok_str=$(echo "$info" | cut -d'|' -f3)
-        echo ""
-        echo "  Current session: $size_str ($tok_str)"
-    fi
-
-    echo ""
-    read -rp "  Trim this session? [y/N] " do_trim_ans
-    if [[ "$do_trim_ans" =~ ^[yY]$ ]]; then
-        do_trim "$guid"
-        [[ -n "$TRIM_NEW_GUID" ]] && guid="$TRIM_NEW_GUID"
-    fi
-
-    echo ""
-    read -rp "  Create a new compacted session, built from a structured rebuild of this one? [y/N] " do_refresh_ans
-    if [[ "$do_refresh_ans" =~ ^[yY]$ ]]; then
-        do_refresh "$guid"
-    fi
-}
-
-# --- Section 11.10: Do-EditList ---
-do_edit_list() {
-    while true; do
-        echo ""
-        echo "  === Edit Sessions ==="
-        echo ""
-        local i=0
-        while IFS='|' read -r guid dir desc tokens; do
-            [[ -z "$guid" ]] && continue
-            [[ "$guid" == "[archived]" ]] && break
-            ((i++))
-            echo "  $i. $desc  [$dir]"
-        done < "$SESSIONS_FILE"
-        echo ""
-        echo "  R# = Rename   P# = Path   A# = Archive   D# = Delete   M#,# = Move   Q = Done"
-        echo ""
-        read -rp "  > " cmd
-        [[ -z "$cmd" || "$cmd" =~ ^[qQ]$ ]] && return
-
-        if [[ "$cmd" =~ ^[rR]([0-9]+)$ ]]; then
-            local idx=${BASH_REMATCH[1]}
-            local line; line=$(get_sessions | sed -n "${idx}p")
-            if [[ -n "$line" ]]; then
-                local cur_desc; cur_desc=$(echo "$line" | cut -d'|' -f4)
-                read -rp "  New name for '$cur_desc': " new_name
-                if [[ -n "$new_name" ]]; then
-                    local g d t
-                    g=$(echo "$line" | cut -d'|' -f2)
-                    d=$(echo "$line" | cut -d'|' -f3)
-                    t=$(echo "$line" | cut -d'|' -f5)
-                    acquire_sessions_lock
-                    local tmp; tmp=$(mktemp)
-                    local cnt=0 in_arch=false
-                    while IFS= read -r ln; do
-                        if [[ "$ln" == "[archived]" ]]; then in_arch=true; echo "$ln" >> "$tmp"; continue; fi
-                        if $in_arch || [[ -z "$ln" ]]; then [[ -n "$ln" ]] && echo "$ln" >> "$tmp"; continue; fi
-                        ((cnt++))
-                        if (( cnt == idx )); then
-                            echo "$g|$d|$new_name|$t" >> "$tmp"
-                        else
-                            echo "$ln" >> "$tmp"
-                        fi
-                    done < "$SESSIONS_FILE"
-                    mv "$tmp" "$SESSIONS_FILE"
-                    release_sessions_lock
-                fi
-            else
-                echo "  Invalid number."
-            fi
-        elif [[ "$cmd" =~ ^[pP]([0-9]+)$ ]]; then
-            local idx=${BASH_REMATCH[1]}
-            local line; line=$(get_sessions | sed -n "${idx}p")
-            if [[ -n "$line" ]]; then
-                local g cur_d desc t
-                g=$(echo "$line" | cut -d'|' -f2)
-                cur_d=$(echo "$line" | cut -d'|' -f3)
-                desc=$(echo "$line" | cut -d'|' -f4)
-                t=$(echo "$line" | cut -d'|' -f5)
-                echo "  Current: $cur_d"
-                read -rp "  New path (Enter to keep): " new_path
-                if [[ -n "$new_path" ]]; then
-                    if [[ ! -d "$new_path" ]]; then
-                        echo "  Path does not exist: $new_path"
-                        continue
-                    fi
-                    local old_key new_key claude_proj old_file new_dir new_file
-                    old_key=$(get_proj_key "$cur_d")
-                    new_key=$(get_proj_key "$new_path")
-                    claude_proj="$HOME/.claude/projects"
-                    old_file="$claude_proj/$old_key/$g.jsonl"
-                    new_dir="$claude_proj/$new_key"
-                    new_file="$new_dir/$g.jsonl"
-                    if [[ -f "$old_file" ]]; then
-                        mkdir -p "$new_dir"
-                        cp "$old_file" "$new_file"
-                        echo "  Session file copied to new project directory."
-                    else
-                        echo "  Warning: Session file not found at old path. Resume may not work."
-                    fi
-                    acquire_sessions_lock
-                    local tmp; tmp=$(mktemp)
-                    local cnt=0 in_arch=false
-                    while IFS= read -r ln; do
-                        if [[ "$ln" == "[archived]" ]]; then in_arch=true; echo "$ln" >> "$tmp"; continue; fi
-                        if $in_arch || [[ -z "$ln" ]]; then [[ -n "$ln" ]] && echo "$ln" >> "$tmp"; continue; fi
-                        ((cnt++))
-                        if (( cnt == idx )); then
-                            echo "$g|$new_path|$desc|$t" >> "$tmp"
-                        else
-                            echo "$ln" >> "$tmp"
-                        fi
-                    done < "$SESSIONS_FILE"
-                    mv "$tmp" "$SESSIONS_FILE"
-                    release_sessions_lock
-                    sync_session_index "$new_path"
-                    sync_session_index "$cur_d"
-                fi
-            else
-                echo "  Invalid number."
-            fi
-        elif [[ "$cmd" =~ ^[aA]([0-9]+)$ ]]; then
-            local idx=${BASH_REMATCH[1]}
-            local line; line=$(get_sessions | sed -n "${idx}p")
-            if [[ -n "$line" ]]; then
-                local g d desc t
-                g=$(echo "$line" | cut -d'|' -f2)
-                d=$(echo "$line" | cut -d'|' -f3)
-                desc=$(echo "$line" | cut -d'|' -f4)
-                t=$(echo "$line" | cut -d'|' -f5)
-                acquire_sessions_lock
-                local tmp; tmp=$(mktemp)
-                local cnt=0 in_arch=false has_arch=false arch_tmp; arch_tmp=$(mktemp)
-                while IFS= read -r ln; do
-                    if [[ "$ln" == "[archived]" ]]; then in_arch=true; continue; fi
-                    if $in_arch; then
-                        [[ -n "$ln" ]] && { has_arch=true; echo "$ln" >> "$arch_tmp"; }
-                        continue
-                    fi
-                    [[ -z "$ln" ]] && continue
-                    ((cnt++))
-                    if (( cnt == idx )); then
-                        echo "$g|$d|$desc|$t" >> "$arch_tmp"
-                        has_arch=true
-                    else
-                        echo "$ln" >> "$tmp"
-                    fi
-                done < "$SESSIONS_FILE"
-                {
-                    cat "$tmp"
-                    if $has_arch; then echo "[archived]"; cat "$arch_tmp"; fi
-                } | write_sessions_atomic
-                rm -f "$tmp" "$arch_tmp"
-                release_sessions_lock
-                printf "${C_GREEN}  Archived: %s${C_RESET}\n" "$desc"
-            else
-                echo "  Invalid number."
-            fi
-        elif [[ "$cmd" =~ ^[dD]([0-9]+)$ ]]; then
-            local idx=${BASH_REMATCH[1]}
-            local line; line=$(get_sessions | sed -n "${idx}p")
-            if [[ -n "$line" ]]; then
-                local g d desc
-                g=$(echo "$line" | cut -d'|' -f2)
-                d=$(echo "$line" | cut -d'|' -f3)
-                desc=$(echo "$line" | cut -d'|' -f4)
-                printf "${C_RED}  This permanently deletes the conversation file and all associated data.${C_RESET}\n"
-                printf "${C_RED}  This cannot be undone.${C_RESET}\n"
-                read -rp "  Type 'delete' to confirm: " confirm
-                if [[ "${confirm,,}" == "delete" ]]; then
-                    do_delete_session "$g" "$d"
-                    acquire_sessions_lock
-                    grep -v "^$g|" "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp"
-                    mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
-                    release_sessions_lock
-                    printf "${C_GREEN}  Deleted: %s${C_RESET}\n" "$desc"
-                else
-                    echo "  Cancelled."
-                fi
-            else
-                echo "  Invalid number."
-            fi
-        elif [[ "$cmd" =~ ^[mM]([0-9]+),([0-9]+)$ ]]; then
-            local from=${BASH_REMATCH[1]} to=${BASH_REMATCH[2]}
-            local main_lines=()
-            while IFS= read -r ln; do
-                [[ "$ln" == "[archived]" ]] && break
-                [[ -n "$ln" ]] && main_lines+=("$ln")
-            done < "$SESSIONS_FILE"
-            local n=${#main_lines[@]}
-            if (( from >= 1 && from <= n && to >= 1 && to <= n )); then
-                local item="${main_lines[$((from - 1))]}"
-                # Remove from old position
-                local new_arr=()
-                local j=0
-                for ln in "${main_lines[@]}"; do
-                    ((j++))
-                    [[ $j -eq $from ]] && continue
-                    new_arr+=("$ln")
-                done
-                # Insert at new position
-                local final=()
-                local k=0
-                for ln in "${new_arr[@]}"; do
-                    ((k++))
-                    [[ $k -eq $to ]] && final+=("$item")
-                    final+=("$ln")
-                done
-                # Edge case: inserting at end
-                if (( to > ${#new_arr[@]} )); then final+=("$item"); fi
-                printf '%s\n' "${final[@]}" | save_sessions
-            else
-                echo "  Invalid numbers."
-            fi
-        else
-            echo "  Unknown command."
-        fi
+    # Sync session index.
+    mapfile -t sessions < <(__cm_get_sessions)
+    for s in "${sessions[@]}"; do
+        local g d _desc _t; IFS='|' read -r g d _desc _t <<< "$s"
+        [[ "$g" == "$guid" ]] && { __cm_sync_session_index "$d"; break; }
     done
-}
-
-# --- Section 11.11: Do-ViewArchived ---
-do_view_archived() {
-    while true; do
-        local arch_lines=()
-        while IFS= read -r ln; do
-            arch_lines+=("$ln")
-        done < <(get_archived_sessions)
-        if [[ ${#arch_lines[@]} -eq 0 ]]; then
-            echo ""
-            echo "  No archived sessions."
-            return
-        fi
-        echo ""
-        echo "  === Archived Sessions ==="
-        echo ""
-        local aline
-        for aline in "${arch_lines[@]}"; do
-            IFS='|' read -r idx guid dir desc tokens <<< "$aline"
-            local n=$((idx + 1))
-            local info size_str
-            info=$(get_session_info "$guid" "$dir" "${tokens:-}")
-            size_str=$(echo "$info" | cut -d'|' -f1)
-            echo "  $n. $desc  [$dir]  $size_str"
-        done
-        echo ""
-        echo "  U# = Unarchive   D# = Delete permanently   Q = Back"
-        echo ""
-        read -rp "  > " cmd
-        [[ -z "$cmd" || "$cmd" =~ ^[qQ]$ ]] && return
-
-        if [[ "$cmd" =~ ^[uU]([0-9]+)$ ]]; then
-            local pick=${BASH_REMATCH[1]}
-            local target_line=""
-            for aline in "${arch_lines[@]}"; do
-                IFS='|' read -r idx guid dir desc tokens <<< "$aline"
-                if (( idx + 1 == pick )); then
-                    target_line="$guid|$dir|$desc|$tokens"
-                    break
-                fi
-            done
-            if [[ -n "$target_line" ]]; then
-                acquire_sessions_lock
-                local main_tmp arch_tmp
-                main_tmp=$(mktemp); arch_tmp=$(mktemp)
-                echo "$target_line" > "$main_tmp"
-                local in_arch=false has_arch=false
-                while IFS= read -r ln; do
-                    if [[ "$ln" == "[archived]" ]]; then in_arch=true; continue; fi
-                    if $in_arch; then
-                        [[ -n "$ln" && "$ln" != "$target_line" ]] && { has_arch=true; echo "$ln" >> "$arch_tmp"; }
-                    else
-                        [[ -n "$ln" ]] && echo "$ln" >> "$main_tmp"
-                    fi
-                done < "$SESSIONS_FILE"
-                {
-                    cat "$main_tmp"
-                    if $has_arch; then echo "[archived]"; cat "$arch_tmp"; fi
-                } | write_sessions_atomic
-                rm -f "$main_tmp" "$arch_tmp"
-                release_sessions_lock
-                printf "${C_GREEN}  Unarchived: %s${C_RESET}\n" "$desc"
-            else
-                echo "  Invalid number."
-            fi
-        elif [[ "$cmd" =~ ^[dD]([0-9]+)$ ]]; then
-            local pick=${BASH_REMATCH[1]}
-            local tg="" td="" tdesc="" target_line=""
-            for aline in "${arch_lines[@]}"; do
-                IFS='|' read -r idx guid dir desc tokens <<< "$aline"
-                if (( idx + 1 == pick )); then
-                    tg=$guid; td=$dir; tdesc=$desc
-                    target_line="$guid|$dir|$desc|$tokens"
-                    break
-                fi
-            done
-            if [[ -n "$tg" ]]; then
-                printf "${C_RED}  This permanently deletes the conversation file and all associated data.${C_RESET}\n"
-                printf "${C_RED}  This cannot be undone.${C_RESET}\n"
-                read -rp "  Type 'delete' to confirm: " confirm
-                if [[ "${confirm,,}" == "delete" ]]; then
-                    do_delete_session "$tg" "$td"
-                    acquire_sessions_lock
-                    local main_tmp arch_tmp
-                    main_tmp=$(mktemp); arch_tmp=$(mktemp)
-                    local in_arch=false has_arch=false
-                    while IFS= read -r ln; do
-                        if [[ "$ln" == "[archived]" ]]; then in_arch=true; continue; fi
-                        if $in_arch; then
-                            [[ -n "$ln" && "$ln" != "$target_line" ]] && { has_arch=true; echo "$ln" >> "$arch_tmp"; }
-                        else
-                            [[ -n "$ln" ]] && echo "$ln" >> "$main_tmp"
-                        fi
-                    done < "$SESSIONS_FILE"
-                    {
-                        cat "$main_tmp"
-                        if $has_arch; then echo "[archived]"; cat "$arch_tmp"; fi
-                    } | write_sessions_atomic
-                    rm -f "$main_tmp" "$arch_tmp"
-                    release_sessions_lock
-                    printf "${C_GREEN}  Deleted: %s${C_RESET}\n" "$tdesc"
-                else
-                    echo "  Cancelled."
-                fi
-            else
-                echo "  Invalid number."
-            fi
-        else
-            echo "  Unknown command."
-        fi
+    # Show size + token summary.
+    local cur_s=""
+    for s in "${sessions[@]}"; do
+        local g _d _desc _t; IFS='|' read -r g _d _desc _t <<< "$s"
+        [[ "$g" == "$guid" ]] && { cur_s="$s"; break; }
     done
+    if [[ -n "$cur_s" ]]; then
+        local g d _desc t; IFS='|' read -r g d _desc t <<< "$cur_s"
+        __cm_get_session_info "$g" "$d" "$t"
+        __cm_blank
+        __cm_say "Current session: $__cm_info_size ($__cm_info_tokens)"
+    fi
+    __cm_blank
+    local do_trim; read -rp "  Trim this session? [y/N]: " do_trim
+    if [[ "$do_trim" == "y" || "$do_trim" == "Y" ]]; then
+        __cm_do_trim "$guid"
+        [[ -n "$__cm_trim_new_guid" ]] && guid="$__cm_trim_new_guid"
+    fi
+    __cm_blank
+    local do_refresh; read -rp "  Create a new compacted session, built from a structured rebuild of this one? [y/N]: " do_refresh
+    if [[ "$do_refresh" == "y" || "$do_refresh" == "Y" ]]; then
+        __cm_do_refresh "$guid"
+    fi
 }
 
-# --- Section 11.9: Do-Resume ---
-do_resume() {
+# ==================================================================
+# invoke_claude_launch — bash belt-and-suspenders (spec 11.6 bash branch)
+# ==================================================================
+# Usage: __cm_invoke_claude_launch <session_dir> -- <claude args...>
+# Sets: __cm_launch_sid, __cm_launch_exit.
+#
+# Layer 2 (snapshot diff) is the primary mechanism implemented here.
+# Layer 3 (newest in project key after launch) is implicit by the way
+# we take "newest that wasn't there before".
+# Layer 1 (PID manifest poll) is deferred: bash can't cleanly capture a
+# foreground PID without subshell tricks that interfere with TTY handoff.
+# The spec explicitly allows Layer 1 silent fallback.
+__cm_invoke_claude_launch() {
+    __cm_launch_sid=""; __cm_launch_exit=1
+    local session_dir="$1"; shift
+    [[ "$1" == "--" ]] && shift
+    local claude_exe; claude_exe=$(__cm_resolve_claude) || {
+        __cm_say_c "$__CM_C_RED" "claude executable not found."
+        return 1
+    }
+    local pk pd; pk=$(__cm_get_proj_key "$session_dir"); pd="$HOME/.claude/projects/$pk"
+    # Snapshot before.
+    local before=""
+    if [[ -d "$pd" ]]; then
+        before=$(ls -1 "$pd"/*.jsonl 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.jsonl$//' | sort)
+    fi
+    "$claude_exe" "$@"
+    __cm_launch_exit=$?
+    # Snapshot after.
+    if [[ -d "$pd" ]]; then
+        local after diff sid
+        after=$(ls -1 "$pd"/*.jsonl 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.jsonl$//' | sort)
+        diff=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") 2>/dev/null)
+        # If there's a new UUID, that's our session id.
+        sid=$(printf '%s\n' "$diff" | grep -E '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' | head -1)
+        if [[ -n "$sid" ]]; then
+            __cm_launch_sid="$sid"
+        else
+            # Layer 3: newest in project key (may equal an existing file if no new one was made).
+            local newest; newest=$(ls -1t "$pd"/*.jsonl 2>/dev/null | head -1)
+            [[ -n "$newest" ]] && __cm_launch_sid=$(basename "$newest" .jsonl)
+        fi
+    fi
+    return 0
+}
+
+# ==================================================================
+# Invoke-ResumeWithForkDetection (spec 11.6.1)
+# ==================================================================
+# Sets: __cm_resume_exit, __cm_resume_effective_guid.
+__cm_invoke_resume_with_fork_detection() {
+    local original_guid="$1" project_dir="$2" display_name="$3"
+    __cm_resume_exit=1; __cm_resume_effective_guid="$original_guid"
+    local pk pd; pk=$(__cm_get_proj_key "$project_dir"); pd="$HOME/.claude/projects/$pk"
+    local before_newest=""
+    if [[ -d "$pd" ]]; then
+        local bn; bn=$(ls -1t "$pd"/*.jsonl 2>/dev/null | head -1)
+        [[ -n "$bn" ]] && before_newest=$(basename "$bn" .jsonl)
+    fi
+    local claude_exe; claude_exe=$(__cm_resolve_claude) || return 1
+    "$claude_exe" --dangerously-skip-permissions --resume "$original_guid" -n "$display_name"
+    __cm_resume_exit=$?
+    if (( __cm_resume_exit == 0 )) && [[ -d "$pd" ]]; then
+        local newest; newest=$(ls -1t "$pd"/*.jsonl 2>/dev/null | head -1)
+        if [[ -n "$newest" ]]; then
+            local newest_bn; newest_bn=$(basename "$newest" .jsonl)
+            if [[ "$newest_bn" != "$original_guid" ]] && [[ -z "$before_newest" || "$newest_bn" != "$before_newest" ]]; then
+                # Fork detected. Swap guid in sessions.txt, quarantine predecessor.
+                local sessions=() s new=() swapped=0
+                mapfile -t sessions < <(__cm_get_sessions)
+                for s in "${sessions[@]}"; do
+                    local g d desc t; IFS='|' read -r g d desc t <<< "$s"
+                    if [[ "$g" == "$original_guid" ]]; then
+                        new+=("$newest_bn|$d|$desc|")
+                        swapped=1
+                    else
+                        new+=("$s")
+                    fi
+                done
+                (( swapped )) && __cm_save_sessions "${new[@]}"
+                __cm_resume_effective_guid="$newest_bn"
+                local pred="$pd/$original_guid.jsonl"
+                if [[ -f "$pred" ]]; then
+                    local leaf dest; leaf=$(basename "$project_dir"); dest="$__cm_backup_dir/$leaf"
+                    mkdir -p "$dest" 2>/dev/null
+                    mv -f "$pred" "$dest/$original_guid.jsonl" 2>/dev/null
+                    [[ -d "$pd/$original_guid" ]] && mv -f "$pd/$original_guid" "$dest/$original_guid" 2>/dev/null
+                    __cm_sync_session_index "$project_dir"
+                fi
+            fi
+        fi
+    fi
+    return 0
+}
+
+# ==================================================================
+# Do-Resume
+# ==================================================================
+__cm_do_resume() {
     local pick="$1"
-    local lines=()
-    while IFS= read -r ln; do
-        [[ "$ln" == "[archived]" ]] && break
-        [[ -n "$ln" ]] && lines+=("$ln")
-    done < "$SESSIONS_FILE"
-    if (( pick < 1 || pick > ${#lines[@]} )); then
-        echo "  Invalid selection."
-        return
+    local sessions=()
+    mapfile -t sessions < <(__cm_get_sessions)
+    if (( pick < 1 || pick > ${#sessions[@]} )); then
+        __cm_say "Invalid selection."; return
     fi
-    local sel="${lines[$((pick - 1))]}"
-    local sel_guid sel_dir sel_desc sel_tokens
-    sel_guid=$(echo "$sel" | cut -d'|' -f1)
-    sel_dir=$(echo "$sel" | cut -d'|' -f2)
-    sel_desc=$(echo "$sel" | cut -d'|' -f3)
-    sel_tokens=$(echo "$sel" | cut -d'|' -f4)
-
-    if [[ ! -d "$sel_dir" ]]; then
-        echo "  Error: Project directory not found: $sel_dir"
-        return
+    local sel="${sessions[$((pick - 1))]}"
+    local sel_g sel_d sel_desc sel_t
+    IFS='|' read -r sel_g sel_d sel_desc sel_t <<< "$sel"
+    if [[ ! -d "$sel_d" ]]; then
+        __cm_say "Error: Project directory not found: $sel_d"; return
     fi
-    local orig_dir; orig_dir=$(pwd)
-    cd "$sel_dir" || return
-
-    if do_orphan_scan "$sel_dir" "$sel_guid"; then
-        local display_name; display_name=$(get_display_name "$sel_desc")
-        invoke_claude_launch --dir "$sel_dir" -- --dangerously-skip-permissions --resume "$ORPHAN_SELECTED_GUID" -n "$display_name"
-        if [[ $LAUNCH_EXIT_CODE -eq 0 ]]; then
-            local pg="${LAUNCH_SESSION_ID:-$ORPHAN_SELECTED_GUID}"
-            do_post_exit "$pg"
+    local orig; orig=$(pwd)
+    cd "$sel_d" || return
+    __cm_do_orphan_scan "$sel_d" "$sel_g"
+    if [[ "$__cm_scan_result_action" == "select" ]]; then
+        local display_name="$__cm_machine_name - $sel_desc"
+        __cm_invoke_resume_with_fork_detection "$__cm_scan_result_guid" "$sel_d" "$display_name"
+        (( __cm_resume_exit == 0 )) && __cm_do_post_exit "$__cm_resume_effective_guid"
+        cd "$orig"; return
+    fi
+    __cm_resolve_resume_or_recover "$sel_g" "$sel_d" "$sel_desc" "$sel_t"
+    if [[ "$__cm_recover_action" == "cancel" ]]; then cd "$orig"; return; fi
+    local display_name="$__cm_machine_name - $sel_desc"
+    if [[ "$__cm_recover_action" == "fresh" ]]; then
+        local pk pd; pk=$(__cm_get_proj_key "$sel_d"); pd="$HOME/.claude/projects/$pk"
+        local before_newest=""
+        if [[ -d "$pd" ]]; then
+            local bn; bn=$(ls -1t "$pd"/*.jsonl 2>/dev/null | head -1)
+            [[ -n "$bn" ]] && before_newest=$(basename "$bn" .jsonl)
         fi
-        cd "$orig_dir" || true
-        return
-    fi
-
-    resolve_resume_or_recover "$sel_guid" "$sel_dir" "$sel_desc" "$sel_tokens"
-    if [[ "$RECOVER_ACTION" == "cancel" ]]; then cd "$orig_dir" || true; return; fi
-    local display_name; display_name=$(get_display_name "$sel_desc")
-
-    if [[ "$RECOVER_ACTION" == "fresh" ]]; then
-        # Do NOT delete the old entry before launch. If the launch fails the entry would
-        # be unrecoverable. Swap GUID in place AFTER successful launch.
-        invoke_claude_launch --dir "$sel_dir" -- --dangerously-skip-permissions -n "$display_name"
-        if [[ $LAUNCH_EXIT_CODE -eq 0 && -n "$LAUNCH_SESSION_ID" ]]; then
-            swap_session_guid "$sel_guid" "$LAUNCH_SESSION_ID"
-            do_post_exit "$LAUNCH_SESSION_ID"
+        local claude_exe; claude_exe=$(__cm_resolve_claude)
+        "$claude_exe" --dangerously-skip-permissions -n "$display_name"
+        if (( $? == 0 )); then
+            local newest; newest=$(ls -1t "$pd"/*.jsonl 2>/dev/null | head -1)
+            if [[ -n "$newest" ]]; then
+                local nb; nb=$(basename "$newest" .jsonl)
+                if [[ -z "$before_newest" || "$nb" != "$before_newest" ]]; then
+                    # Swap GUID in place in sessions.txt, preserve desc and dir, reset tokens.
+                    local ses=() s new=()
+                    mapfile -t ses < <(__cm_get_sessions)
+                    for s in "${ses[@]}"; do
+                        local g d desc t; IFS='|' read -r g d desc t <<< "$s"
+                        if [[ "$g" == "$sel_g" ]]; then new+=("$nb|$d|$desc|")
+                        else new+=("$s"); fi
+                    done
+                    __cm_save_sessions "${new[@]}"
+                    __cm_do_post_exit "$nb"
+                fi
+            fi
         fi
-        cd "$orig_dir" || true
-        return
+        cd "$orig"; return
     fi
-    if [[ "$RECOVER_ACTION" == "primed" ]]; then
-        invoke_claude_launch --dir "$sel_dir" -- --dangerously-skip-permissions --resume "$RECOVER_GUID" -n "$display_name"
-        if [[ $LAUNCH_EXIT_CODE -eq 0 ]]; then
-            local pg="${LAUNCH_SESSION_ID:-$RECOVER_GUID}"
-            do_post_exit "$pg"
-        fi
-        cd "$orig_dir" || true
-        return
+    if [[ "$__cm_recover_action" == "primed" ]]; then
+        __cm_invoke_resume_with_fork_detection "$__cm_recover_guid" "$sel_d" "$display_name"
+        (( __cm_resume_exit == 0 )) && __cm_do_post_exit "$__cm_resume_effective_guid"
+        cd "$orig"; return
     fi
-
-    invoke_claude_launch --dir "$sel_dir" -- --dangerously-skip-permissions --resume "$sel_guid" -n "$display_name"
-    if [[ $LAUNCH_EXIT_CODE -eq 0 ]]; then
-        local pg="${LAUNCH_SESSION_ID:-$sel_guid}"
-        do_post_exit "$pg"
+    # Normal resume branch.
+    __cm_invoke_resume_with_fork_detection "$sel_g" "$sel_d" "$display_name"
+    if (( __cm_resume_exit == 0 )); then
+        __cm_do_post_exit "$__cm_resume_effective_guid"
     else
-        echo ""
-        read -rp "  Session not found. Delete this entry? [Y/n] " del_entry
-        if [[ "$del_entry" != "n" ]]; then
-            acquire_sessions_lock
-            grep -v "^$sel_guid|" "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp"
-            mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
-            release_sessions_lock
-            echo "  Entry removed."
-        fi
-    fi
-    cd "$orig_dir" || true
-}
-
-# --- Section 11.7-11.8: New project from list mode ---
-start_new_project_from_list() {
-    local title="$1"
-    local safe_name new_dir counter=1
-    safe_name=$(echo "$title" | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+/-/g; s/[^a-z0-9_-]//g')
-    new_dir="$(pwd)/$safe_name"
-    while [[ -e "$new_dir" ]]; do
-        new_dir="$(pwd)/${safe_name}(${counter})"
-        ((counter++))
-    done
-    mkdir -p "$new_dir"
-    echo ""
-    echo "  Starting new session: $title"
-    echo "  Project dir: $new_dir"
-    local orig_dir; orig_dir=$(pwd)
-    cd "$new_dir" || return
-    local display_name; display_name=$(get_display_name "$title")
-    invoke_claude_launch --dir "$new_dir" -- --dangerously-skip-permissions -n "$display_name"
-    if [[ -n "$LAUNCH_SESSION_ID" ]]; then
-        acquire_sessions_lock
-        local tmp; tmp=$(mktemp)
-        echo "$LAUNCH_SESSION_ID|$new_dir|$title|" > "$tmp"
-        cat "$SESSIONS_FILE" >> "$tmp"
-        mv "$tmp" "$SESSIONS_FILE"
-        release_sessions_lock
-    fi
-    cd "$orig_dir" || true
-}
-
-# --- Section 11.1: List mode ---
-list_mode() {
-    while true; do
-        local count
-        count=$(get_session_count)
-        if (( count == 0 )); then
-            echo ""
-            echo "  No saved sessions."
-            echo ""
-            return
-        fi
-        show_list
-        echo ""
-        read -rp "  Pick a session (Enter to quit): " pick
-        [[ -z "$pick" ]] && return
-        if [[ "$pick" =~ ^[eE]$ ]]; then do_edit_list; continue; fi
-        if [[ "$pick" =~ ^[vV]$ ]]; then do_view_archived; continue; fi
-        if [[ "$pick" =~ ^[mM]$ ]]; then
-            echo ""
-            echo "  Current machine name: $MACHINE_NAME"
-            read -rp "  New name (Enter to keep): " new_mn
-            if [[ -n "$new_mn" ]]; then
-                echo "$new_mn" > "$MACHINE_NAME_FILE"
-                MACHINE_NAME="$new_mn"
-                printf "${C_GREEN}  Machine name set to: %s${C_RESET}\n" "$MACHINE_NAME"
-            fi
-            continue
-        fi
-        if [[ "$pick" =~ ^[0-9]+$ ]]; then
-            do_resume "$pick"
-            return
-        fi
-        # Treat as new project title
-        start_new_project_from_list "$pick"
-        return
-    done
-}
-
-# --- Main dispatch ---
-first_arg="${1:-}"
-
-# List mode
-case "$first_arg" in
-    l|L|-l|-L) list_mode; exit 0 ;;
-esac
-
-# Direct resume by number
-if [[ "$first_arg" =~ ^[0-9]+$ ]]; then
-    count=$(get_session_count)
-    if (( count == 0 )); then
-        echo "  No saved sessions."
-        exit 0
-    fi
-    show_list "$first_arg"
-    do_resume "$first_arg"
-    exit 0
-fi
-
-# Normal mode: parse --proj and pass-args
-proj_dir=""
-pass_args=()
-i=1
-while (( i <= $# )); do
-    arg="${!i}"
-    if [[ "$arg" == "--proj" ]]; then
-        ((i++))
-        proj_dir="${!i}"
-        ((i++))
-    else
-        pass_args+=("$arg")
-        ((i++))
-    fi
-done
-
-orig_dir=$(pwd)
-if [[ -n "$proj_dir" ]]; then
-    if [[ ! -d "$proj_dir" ]]; then
-        echo "Error: Directory not found: $proj_dir"
-        exit 1
-    fi
-    cd "$proj_dir" || exit 1
-fi
-
-cur_dir=$(pwd)
-match_line=$(grep -F "|$cur_dir|" "$SESSIONS_FILE" 2>/dev/null | head -1)
-pre_named=""
-
-if [[ -n "$match_line" && ${#pass_args[@]} -eq 0 ]]; then
-    match_guid=$(echo "$match_line" | cut -d'|' -f1)
-    match_desc=$(echo "$match_line" | cut -d'|' -f3)
-    match_tokens=$(echo "$match_line" | cut -d'|' -f4)
-
-    if do_orphan_scan "$cur_dir" "$match_guid"; then
-        display_name=$(get_display_name "$match_desc")
-        invoke_claude_launch --dir "$cur_dir" -- --dangerously-skip-permissions --resume "$ORPHAN_SELECTED_GUID" -n "$display_name"
-        if [[ $LAUNCH_EXIT_CODE -eq 0 ]]; then
-            pg="${LAUNCH_SESSION_ID:-$ORPHAN_SELECTED_GUID}"
-            do_post_exit "$pg"
-        fi
-        [[ -n "$proj_dir" ]] && cd "$orig_dir"
-        exit 0
-    fi
-
-    echo ""
-    echo "  Session found: $match_desc"
-    read -rp "  Rename? (Enter to keep): " rename
-    if [[ -n "$rename" ]]; then
-        acquire_sessions_lock
-        sed -i "s|^${match_guid}|${cur_dir}|.*|${match_guid}|${cur_dir}|${rename}|.*|" "$SESSIONS_FILE" 2>/dev/null
-        # The above sed is finicky with separators; do it via node for safety
-        if [[ -n "$NODE_EXE" ]]; then
-            "$NODE_EXE" -e "
-                const fs = require('fs');
-                const lines = fs.readFileSync('$SESSIONS_FILE', 'utf8').split('\n');
-                for (let i = 0; i < lines.length; i++) {
-                    if (lines[i] === '[archived]') break;
-                    const p = lines[i].split('|');
-                    if (p[0] === '$match_guid') {
-                        p[2] = '$rename';
-                        lines[i] = p.join('|');
-                    }
-                }
-                fs.writeFileSync('$SESSIONS_FILE', lines.join('\n'));
-            " 2>/dev/null
-        fi
-        release_sessions_lock
-        match_desc="$rename"
-    fi
-    read -rp "  Resume this session? [Y/n] " use_existing
-    if [[ "$use_existing" != "n" ]]; then
-        resolve_resume_or_recover "$match_guid" "$cur_dir" "$match_desc" "$match_tokens"
-        if [[ "$RECOVER_ACTION" == "cancel" ]]; then [[ -n "$proj_dir" ]] && cd "$orig_dir"; exit 0; fi
-        display_name=$(get_display_name "$match_desc")
-
-        if [[ "$RECOVER_ACTION" == "fresh" ]]; then
-            # Do NOT delete the old entry before launch. Swap GUID in place AFTER successful launch.
-            invoke_claude_launch --dir "$cur_dir" -- --dangerously-skip-permissions -n "$display_name"
-            if [[ $LAUNCH_EXIT_CODE -eq 0 && -n "$LAUNCH_SESSION_ID" ]]; then
-                swap_session_guid "$match_guid" "$LAUNCH_SESSION_ID"
-                do_post_exit "$LAUNCH_SESSION_ID"
-            fi
-            [[ -n "$proj_dir" ]] && cd "$orig_dir"
-            exit 0
-        fi
-        if [[ "$RECOVER_ACTION" == "primed" ]]; then
-            invoke_claude_launch --dir "$cur_dir" -- --dangerously-skip-permissions --resume "$RECOVER_GUID" -n "$display_name"
-            if [[ $LAUNCH_EXIT_CODE -eq 0 ]]; then
-                pg="${LAUNCH_SESSION_ID:-$RECOVER_GUID}"
-                do_post_exit "$pg"
-            fi
-            [[ -n "$proj_dir" ]] && cd "$orig_dir"
-            exit 0
-        fi
-
-        invoke_claude_launch --dir "$cur_dir" -- --dangerously-skip-permissions --resume "$match_guid" -n "$display_name"
-        if [[ $LAUNCH_EXIT_CODE -eq 0 ]]; then
-            pg="${LAUNCH_SESSION_ID:-$match_guid}"
-            do_post_exit "$pg"
+        local pk; pk=$(__cm_get_proj_key "$sel_d")
+        local jp="$HOME/.claude/projects/$pk/$sel_g.jsonl"
+        if [[ -f "$jp" ]]; then
+            __cm_blank
+            __cm_say_c "$__CM_C_YELLOW" "Claude refused to resume this session (file is on disk but Claude won't load it)."
+            __cm_say "Common causes: interrupted tool call, stale deferred-tool marker."
+            __cm_say "The session entry has NOT been deleted. You can try again later or investigate the JSONL."
         else
-            echo ""
-            read -rp "  Session not found. Delete this entry? [Y/n] " del_entry
-            if [[ "$del_entry" != "n" ]]; then
-                acquire_sessions_lock
-                grep -v "^$match_guid|" "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp"
-                mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
-                release_sessions_lock
-                echo "  Entry removed."
+            __cm_blank
+            local ans; read -rp "  Session JSONL is missing. Delete this entry? [Y/n]: " ans
+            if [[ "$ans" != "n" && "$ans" != "N" ]]; then
+                local ses=() s new=()
+                mapfile -t ses < <(__cm_get_sessions)
+                for s in "${ses[@]}"; do
+                    local g _d _desc _t; IFS='|' read -r g _d _desc _t <<< "$s"
+                    [[ "$g" != "$sel_g" ]] && new+=("$s")
+                done
+                __cm_save_sessions "${new[@]}"
+                __cm_say "Entry removed."
             fi
         fi
-        [[ -n "$proj_dir" ]] && cd "$orig_dir"
-        exit 0
     fi
-fi
+    cd "$orig"
+}
 
-if [[ -z "$match_line" && ${#pass_args[@]} -eq 0 ]]; then
-    echo ""
-    echo "  No session entry found for this directory."
-    folder_default=$(basename "$(pwd)" | tr '-' ' ' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)}1')
-    read -rp "  Create a name for this session (Enter for '$folder_default', 'skip' to skip): " pre_named
-    if [[ "$pre_named" == "skip" ]]; then pre_named=""
-    elif [[ -z "$pre_named" ]]; then pre_named="$folder_default"
+# ==================================================================
+# Main entry: claudecm
+# ==================================================================
+claudecm() {
+    # Bootstrap
+    export CLAUDE_CODE_REMOTE_SEND_KEEPALIVES=1
+    mkdir -p "$__cm_cm_dir" "$__cm_backup_dir" 2>/dev/null
+    [[ -f "$__cm_sessions_file" ]] || : > "$__cm_sessions_file"
+    __cm_ensure_cleanup_period_days
+    __cm_auto_backup_sessions
+    # Machine name.
+    if [[ ! -f "$__cm_machine_name_file" ]]; then
+        __cm_blank
+        local mn; read -rp "  Machine name for remote display (e.g. desktop, laptop): " mn
+        if [[ -z "$mn" ]]; then
+            mn=$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            [[ -z "$mn" ]] && mn="unknown"
+        fi
+        printf '%s\n' "$mn" > "$__cm_machine_name_file"
+        __cm_say "Saved: $mn"
     fi
-fi
+    __cm_machine_name=$(head -1 "$__cm_machine_name_file" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$__cm_machine_name" ]]; then
+        __cm_machine_name=$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    fi
 
-# Fresh launch
-launch_desc="${pre_named:-${match_desc:-$(basename "$(pwd)")}}"
-display_name=$(get_display_name "$launch_desc")
-launch_args=(--dangerously-skip-permissions -n "$display_name")
-[[ ${#pass_args[@]} -gt 0 ]] && launch_args+=("${pass_args[@]}")
-invoke_claude_launch --dir "$(pwd)" -- "${launch_args[@]}"
+    local first="${1:-}"
+    # List mode
+    if [[ "$first" == "l" || "$first" == "L" || "$first" == "-l" || "$first" == "-L" ]]; then
+        while true; do
+            local sessions=()
+            mapfile -t sessions < <(__cm_get_sessions)
+            if (( ${#sessions[@]} == 0 )); then
+                __cm_blank; __cm_say "No saved sessions."; __cm_blank; return
+            fi
+            __cm_show_list 0
+            __cm_blank
+            local pick; read -rp "  Pick a session (Enter to quit): " pick
+            [[ -z "$pick" ]] && return
+            if [[ "$pick" == "e" || "$pick" == "E" ]]; then __cm_do_edit_list; continue; fi
+            if [[ "$pick" == "v" || "$pick" == "V" ]]; then __cm_do_view_archived; continue; fi
+            if [[ "$pick" == "m" || "$pick" == "M" ]]; then
+                __cm_blank
+                __cm_say "Current machine name: $__cm_machine_name"
+                local nm; read -rp "  New name (Enter to keep): " nm
+                if [[ -n "$nm" ]]; then
+                    printf '%s\n' "$nm" > "$__cm_machine_name_file"
+                    __cm_machine_name="$nm"
+                    __cm_say_c "$__CM_C_GREEN" "Machine name set to: $__cm_machine_name"
+                fi
+                continue
+            fi
+            if [[ "$pick" =~ ^[0-9]+$ ]]; then
+                __cm_do_resume "$pick"; return
+            fi
+            # Non-numeric: new project title.
+            local safe_name
+            safe_name=$(printf '%s' "$pick" | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+/-/g; s/[^a-z0-9_-]//g')
+            local new_proj="$(pwd)/$safe_name" counter=1
+            while [[ -e "$new_proj" ]]; do
+                new_proj="$(pwd)/${safe_name}($counter)"; counter=$((counter + 1))
+            done
+            mkdir -p "$new_proj"
+            __cm_blank
+            __cm_say "Starting new session: $pick"
+            __cm_say "Project dir: $new_proj"
+            local orig; orig=$(pwd)
+            cd "$new_proj"
+            local display_name="$__cm_machine_name - $pick"
+            __cm_invoke_claude_launch "$new_proj" -- --dangerously-skip-permissions -n "$display_name"
+            if [[ -n "$__cm_launch_sid" ]]; then
+                local sessions=()
+                mapfile -t sessions < <(__cm_get_sessions)
+                __cm_save_sessions "$__cm_launch_sid|$new_proj|$pick|" "${sessions[@]}"
+                __cm_do_post_exit "$__cm_launch_sid"
+            fi
+            cd "$orig"
+            return
+        done
+        return
+    fi
+    # Direct resume by number
+    if [[ "$first" =~ ^[0-9]+$ ]]; then
+        local sessions=()
+        mapfile -t sessions < <(__cm_get_sessions)
+        if (( ${#sessions[@]} == 0 )); then __cm_say "No saved sessions."; return; fi
+        __cm_show_list "$first"
+        __cm_do_resume "$first"
+        return
+    fi
+    # Normal mode: parse --proj and passArgs.
+    local proj_dir="" pass_args=()
+    while (( $# > 0 )); do
+        if [[ "$1" == "--proj" ]]; then
+            proj_dir="${2:-}"; shift 2
+        else
+            pass_args+=("$1"); shift
+        fi
+    done
+    local orig; orig=$(pwd)
+    if [[ -n "$proj_dir" ]]; then
+        if [[ ! -d "$proj_dir" ]]; then __cm_say "Error: Directory not found: $proj_dir"; return; fi
+        cd "$proj_dir"
+    fi
+    local cur_dir; cur_dir=$(pwd)
+    local sessions=() s match=""
+    mapfile -t sessions < <(__cm_get_sessions)
+    for s in "${sessions[@]}"; do
+        local g d _desc _t; IFS='|' read -r g d _desc _t <<< "$s"
+        [[ "$d" == "$cur_dir" ]] && { match="$s"; break; }
+    done
+    local pre_named=""
+    if (( ${#pass_args[@]} == 0 )); then
+        if [[ -n "$match" ]]; then
+            local mg md mdesc mt; IFS='|' read -r mg md mdesc mt <<< "$match"
+            __cm_do_orphan_scan "$cur_dir" "$mg"
+            if [[ "$__cm_scan_result_action" == "select" ]]; then
+                if [[ ! -d "$md" ]]; then __cm_say "Error: Project directory not found: $md"; return; fi
+                cd "$md"
+                local dn="$__cm_machine_name - $mdesc"
+                __cm_invoke_resume_with_fork_detection "$__cm_scan_result_guid" "$md" "$dn"
+                (( __cm_resume_exit == 0 )) && __cm_do_post_exit "$__cm_resume_effective_guid"
+                [[ -n "$proj_dir" ]] && cd "$orig"
+                return
+            fi
+            __cm_blank
+            __cm_say "Session found: $mdesc"
+            local rename_ans; read -rp "  Rename? (Enter to keep): " rename_ans
+            if [[ -n "$rename_ans" ]]; then
+                local new=() ss
+                for ss in "${sessions[@]}"; do
+                    local g d desc t; IFS='|' read -r g d desc t <<< "$ss"
+                    if [[ "$g" == "$mg" ]]; then new+=("$g|$d|$rename_ans|$t"); mdesc="$rename_ans"
+                    else new+=("$ss"); fi
+                done
+                __cm_save_sessions "${new[@]}"
+            fi
+            local use_ans; read -rp "  Resume this session? [Y/n]: " use_ans
+            if [[ "$use_ans" != "n" && "$use_ans" != "N" ]]; then
+                if [[ ! -d "$md" ]]; then __cm_say "Error: Project directory not found: $md"; return; fi
+                cd "$md"
+                __cm_resolve_resume_or_recover "$mg" "$md" "$mdesc" "$mt"
+                if [[ "$__cm_recover_action" == "cancel" ]]; then [[ -n "$proj_dir" ]] && cd "$orig"; return; fi
+                local dn="$__cm_machine_name - $mdesc"
+                if [[ "$__cm_recover_action" == "fresh" ]]; then
+                    local pk pd; pk=$(__cm_get_proj_key "$md"); pd="$HOME/.claude/projects/$pk"
+                    local before_newest=""
+                    if [[ -d "$pd" ]]; then
+                        local bn; bn=$(ls -1t "$pd"/*.jsonl 2>/dev/null | head -1)
+                        [[ -n "$bn" ]] && before_newest=$(basename "$bn" .jsonl)
+                    fi
+                    local claude_exe; claude_exe=$(__cm_resolve_claude)
+                    "$claude_exe" --dangerously-skip-permissions -n "$dn"
+                    if (( $? == 0 )); then
+                        local newest; newest=$(ls -1t "$pd"/*.jsonl 2>/dev/null | head -1)
+                        if [[ -n "$newest" ]]; then
+                            local nb; nb=$(basename "$newest" .jsonl)
+                            if [[ -z "$before_newest" || "$nb" != "$before_newest" ]]; then
+                                local ses=() ns new=()
+                                mapfile -t ses < <(__cm_get_sessions)
+                                for ns in "${ses[@]}"; do
+                                    local g d desc t; IFS='|' read -r g d desc t <<< "$ns"
+                                    if [[ "$g" == "$mg" ]]; then new+=("$nb|$d|$desc|")
+                                    else new+=("$ns"); fi
+                                done
+                                __cm_save_sessions "${new[@]}"
+                                __cm_do_post_exit "$nb"
+                            fi
+                        fi
+                    fi
+                    [[ -n "$proj_dir" ]] && cd "$orig"
+                    return
+                fi
+                if [[ "$__cm_recover_action" == "primed" ]]; then
+                    __cm_invoke_resume_with_fork_detection "$__cm_recover_guid" "$md" "$dn"
+                    (( __cm_resume_exit == 0 )) && __cm_do_post_exit "$__cm_resume_effective_guid"
+                    [[ -n "$proj_dir" ]] && cd "$orig"
+                    return
+                fi
+                __cm_invoke_resume_with_fork_detection "$mg" "$md" "$dn"
+                if (( __cm_resume_exit == 0 )); then
+                    __cm_do_post_exit "$__cm_resume_effective_guid"
+                else
+                    local pk; pk=$(__cm_get_proj_key "$md")
+                    local jp="$HOME/.claude/projects/$pk/$mg.jsonl"
+                    if [[ -f "$jp" ]]; then
+                        __cm_blank
+                        __cm_say_c "$__CM_C_YELLOW" "Claude refused to resume this session (file is on disk but Claude won't load it)."
+                        __cm_say "Common causes: interrupted tool call, stale deferred-tool marker."
+                        __cm_say "The session entry has NOT been deleted."
+                    else
+                        __cm_blank
+                        local del; read -rp "  Session JSONL is missing. Delete this entry? [Y/n]: " del
+                        if [[ "$del" != "n" && "$del" != "N" ]]; then
+                            local ses=() ns new=()
+                            mapfile -t ses < <(__cm_get_sessions)
+                            for ns in "${ses[@]}"; do
+                                local g _d _desc _t; IFS='|' read -r g _d _desc _t <<< "$ns"
+                                [[ "$g" != "$mg" ]] && new+=("$ns")
+                            done
+                            __cm_save_sessions "${new[@]}"
+                            __cm_say "Entry removed."
+                        fi
+                    fi
+                fi
+                [[ -n "$proj_dir" ]] && cd "$orig"
+                return
+            fi
+        else
+            __cm_blank
+            __cm_say "No session entry found for this directory."
+            local fd; fd=$(basename "$(pwd)")
+            fd="${fd//-/ }"
+            fd=$(printf '%s' "$fd" | awk '{for(i=1;i<=NF;i++)$i=toupper(substr($i,1,1)) tolower(substr($i,2)); print}')
+            read -rp "  Create a name for this session (Enter for '$fd', 'skip' to skip): " pre_named
+            if [[ "$pre_named" == "skip" ]]; then pre_named=""
+            elif [[ -z "$pre_named" ]]; then pre_named="$fd"; fi
+        fi
+    fi
+    # Fresh launch path.
+    local launch_desc
+    if [[ -n "$pre_named" ]]; then launch_desc="$pre_named"
+    elif [[ -n "$match" ]]; then local _g _d _dd _t; IFS='|' read -r _g _d _dd _t <<< "$match"; launch_desc="$_dd"
+    else launch_desc=$(basename "$(pwd)"); fi
+    local display_name="$__cm_machine_name - $launch_desc"
+    __cm_invoke_claude_launch "$cur_dir" -- --dangerously-skip-permissions -n "$display_name" "${pass_args[@]}"
+    if (( __cm_launch_exit != 0 )); then
+        [[ -n "$proj_dir" ]] && cd "$orig"
+        return
+    fi
+    if [[ -n "$pre_named" ]]; then
+        if [[ -n "$__cm_launch_sid" ]]; then
+            local ses=()
+            mapfile -t ses < <(__cm_get_sessions)
+            __cm_save_sessions "$__cm_launch_sid|$cur_dir|$pre_named|" "${ses[@]}"
+            __cm_do_post_exit "$__cm_launch_sid"
+        else
+            __cm_do_post_exit
+        fi
+    else
+        if [[ -n "$__cm_launch_sid" ]]; then __cm_do_post_exit "$__cm_launch_sid"
+        else __cm_do_post_exit; fi
+    fi
+    [[ -n "$proj_dir" ]] && cd "$orig"
+}
 
-if [[ $LAUNCH_EXIT_CODE -ne 0 ]]; then
-    [[ -n "$proj_dir" ]] && cd "$orig_dir"
-    exit $LAUNCH_EXIT_CODE
-fi
-
-if [[ -n "$pre_named" && -n "$LAUNCH_SESSION_ID" ]]; then
-    acquire_sessions_lock
-    tmp=$(mktemp)
-    echo "$LAUNCH_SESSION_ID|$cur_dir|$pre_named|" > "$tmp"
-    cat "$SESSIONS_FILE" >> "$tmp"
-    mv "$tmp" "$SESSIONS_FILE"
-    release_sessions_lock
-    do_post_exit "$LAUNCH_SESSION_ID"
-else
-    do_post_exit "$LAUNCH_SESSION_ID"
-fi
-
-[[ -n "$proj_dir" ]] && cd "$orig_dir"
-exit 0
