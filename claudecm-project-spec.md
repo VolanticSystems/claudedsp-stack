@@ -407,7 +407,7 @@ fi
 
 ### 11.6.1 Resume with fork detection
 
-Inputs: `originalGuid`, `projectDir`, `displayName`. Returns: `{ ExitCode, EffectiveGuid }`.
+Inputs: `originalGuid`, `projectDir`, `displayName`. **PowerShell:** sets `$script:lastResumeExit` and `$script:lastResumeGuid`; **bash:** sets `__cm_resume_exit` and `__cm_resume_effective_guid` globals. **Does not return a value.** See Section 14.2 for why.
 
 A thin wrapper around the Section 11.6 launch path, used for every `--resume` invocation. It exists because Claude Code can fork a resumed session into a new JSONL file under several conditions observed in the wild (version upgrades between resumes, deferred-tool recovery, state transitions). When that happens, the post-resume "live" file is not the one we asked to resume — the old file is effectively abandoned, and if we treat it as still current, we orphan the new file and misreport tokens against the dead one.
 
@@ -425,13 +425,13 @@ Steps:
      - Set `effectiveGuid` to the newest basename.
      - Quarantine the predecessor: move `<originalGuid>.jsonl` (and its sidecar dir if present) from `projDirClaude` into `<backupDir>/<projectLeaf>/`. Then call `Sync-SessionIndex` on `projectDir`. The predecessor is wholly subsumed by the fork (Claude Code copies its history forward), so leaving it on disk would only produce a spurious orphan warning on the next launch.
    - Otherwise `effectiveGuid` stays equal to `originalGuid`.
-5. Return `{ ExitCode, EffectiveGuid }`. Caller runs Do-PostExit on the effective guid.
+5. Set the script-scoped/global outcome variables. Caller reads them and runs Do-PostExit on the effective guid.
 
 **Single-source rule:** every `--resume` call in the codebase routes through this helper. Bare `claude --resume ...` calls followed by `Do-PostExit <original-guid>` are forbidden — they are the exact shape that produces fork-orphans.
 
 ### 11.6.2 Fresh launch with set-diff detection
 
-Inputs: `projectDir`, `displayName`, `passArgs` (array). Returns: `{ ExitCode, NewGuid }`.
+Inputs: `projectDir`, `displayName`, `passArgs` (array). **PowerShell:** sets `$script:lastFreshExit` and `$script:lastFreshNewGuid`; **bash:** sets equivalent globals. **Does not return a value.** See Section 14.2 for why.
 
 A wrapper around the Section 11.6 launch path, used for every fresh (non-resume) interactive launch. It detects the new session's GUID via set-diff instead of "newest-by-mtime" to survive concurrent writers racing in the same project key directory.
 
@@ -446,7 +446,7 @@ Steps:
    - If 1 element, return its basename as `NewGuid`.
    - If >1 elements, return the newest-by-mtime as `NewGuid` (residual heuristic case; occurs only when two fresh launches race in the same project key dir within one ClaudeCM invocation).
    - If 0 elements, `NewGuid` stays null (user exited at splash, launch aborted, etc).
-5. Return `{ ExitCode, NewGuid }`. Caller decides how to register in sessions.txt.
+5. Set the script-scoped/global outcome variables. Caller reads them and decides how to register in sessions.txt.
 
 **Why set-diff, not "newest-by-mtime":** a concurrent writer in another window can touch an existing JSONL mid-launch, making it appear newer than the file our launch created. "Newest by mtime" picks the wrong one. Set-diff picks only files that did not exist before the launch, so concurrent writers that merely touch existing files are invisible to it. This is race site #4/#5/#6 in `private/how my lazy ass created a bunch of race conditions, and how I plan to unfuckit.md`, validated in `private/meta-prompt-playground/race-4-5-6-sandbox/`.
 
@@ -801,6 +801,28 @@ The following known races are documented and left unfixed because the mitigation
 3. **recovery-prompt.md rotation is unlocked.** If two ClaudeCM windows concurrently generate recovery prompts for different sessions in the same project directory within milliseconds of each other, the `.old` / `.oldN` rotation can clobber. Extremely unlikely in practice (recovery generation is user-initiated and takes ~60s of wall time during which the user is engaged with a single window). Accepted.
 
 4. **Backup file rotation race.** Backups of sessions.txt are rotated by keeping the 20 most recent and deleting older ones. If two ClaudeCM windows rotate in the same second, one could delete a backup the other just created. Worst case: one fewer historical backup than intended. No data loss from the live system. Accepted.
+
+---
+
+### 14.2 Critical PowerShell pattern: helpers that launch interactive children must NOT return values
+
+**This rule exists because violating it cost an entire day of debugging on 2026-04-15/16.**
+
+**The trap.** When you write a PowerShell function that calls an interactive native process (`& $claudeExe ...`) and you assign that function's return value to a variable in the caller (`$r = MyHelper ...`), PowerShell wraps the entire function call in an output-capturing pipeline. The native process's stdout is no longer the console — it's a pipe back into the capture. The native process's TTY-detection check (`process.stdout.isTTY`) returns false, and the process degrades to non-interactive mode (`-p`-equivalent for Claude Code).
+
+**The symptom.** The user picks a session in `claudecm`. ClaudeCM calls `& claude.exe --resume <guid> -n <name>` inside `Invoke-ResumeWithForkDetection`. Claude Code falls into `-p --resume` mode despite no `-p` flag, fires `Error: No deferred tool marker found in the resumed session...`, and exits 1. The interactive TUI never appears. From outside the helper, calling the same `& claude.exe --resume <guid> -n <name>` works perfectly — the difference is that the outside call doesn't have its output stream captured.
+
+**The rule.** Helpers that invoke interactive `claude.exe` (or any native interactive process) MUST communicate results to the caller through script-scoped variables. They MUST NOT use `return @{ ... }` or any pattern the caller would consume with `$x = HelperName ...`. Specifically:
+
+- `Invoke-ResumeWithForkDetection` sets `$script:lastResumeExit` and `$script:lastResumeGuid`.
+- `Invoke-FreshLaunchWithDetection` sets `$script:lastFreshExit` and `$script:lastFreshNewGuid`.
+- Callers invoke the helper without an `=` assignment, then read the script-scoped variables directly.
+
+**Bash equivalence.** The same pattern (output capture) applies in bash if you use command substitution: `r=$(my_helper ...)`. Bash helpers in `claudecm-linux.sh` use module-level globals (`__cm_resume_exit`, `__cm_resume_effective_guid`) for the same reason and are safe.
+
+**Test guard.** `private/meta-prompt-playground/test-cwd-launch.ps1` and the historical writeup in `private/today-was-a-shitshow-output-capture-bug.md` (2026-04-16) preserve the diagnostic approach used to bisect this. Re-run those if a regression is suspected.
+
+**Why this isn't fixable inside Claude Code.** Claude Code's TTY-detection-driven mode switch is by design — `-p` mode is supposed to fire when stdout isn't a terminal, so headless callers (Python `subprocess.run`, CI pipelines, etc.) get well-defined non-interactive behavior. The bug is on our side: capturing a function's output stream in a context where the function spawns an interactive child is a mistake, full stop.
 
 ---
 
