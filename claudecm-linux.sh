@@ -1491,9 +1491,9 @@ claudecm() {
             # Non-numeric: new project title.
             local safe_name
             safe_name=$(printf '%s' "$pick" | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+/-/g; s/[^a-z0-9_-]//g')
-            local new_proj="$(pwd)/$safe_name" counter=1
+            local new_proj="$HOME/$safe_name" counter=1
             while [[ -e "$new_proj" ]]; do
-                new_proj="$(pwd)/${safe_name}($counter)"; counter=$((counter + 1))
+                new_proj="$HOME/${safe_name}($counter)"; counter=$((counter + 1))
             done
             mkdir -p "$new_proj"
             __cm_blank
