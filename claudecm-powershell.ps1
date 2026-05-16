@@ -874,7 +874,7 @@ Read these in order. Do not run builds, tests, or git commands yet. Do not modif
             if (-not (Test-Path $oldJsonl)) {
                 Write-Host "  Old session JSONL not found, skipping skeleton extraction." -ForegroundColor Yellow
             }
-            if (-not (Test-Path $extractScript)) {
+            if (-not $extractScript -or -not (Test-Path $extractScript)) {
                 Write-Host "  extract-skeleton.mjs not found, skipping skeleton extraction." -ForegroundColor Yellow
             }
         }
